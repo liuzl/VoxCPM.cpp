@@ -88,6 +88,24 @@ bool is_vulkan_device(ggml_backend_dev_t dev) {
     return reg_name.find("vulkan") != std::string::npos;
 }
 
+bool is_metal_device(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return false;
+    }
+
+    const enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(dev);
+    if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+        dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        return false;
+    }
+
+    // ggml registers the Metal backend as "MTL", not "metal".
+    const ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const std::string reg_name = to_lower_copy(reg ? ggml_backend_reg_name(reg) : nullptr);
+    return reg_name.find("mtl") != std::string::npos ||
+           reg_name.find("metal") != std::string::npos;
+}
+
 bool is_cuda_device(ggml_backend_dev_t dev) {
     if (!dev) {
         return false;
@@ -143,6 +161,30 @@ BackendInitResult init_vulkan_backend() {
     return result;
 }
 
+BackendInitResult init_metal_backend() {
+    BackendInitResult result;
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!is_metal_device(dev)) {
+            continue;
+        }
+
+        result.backend = ggml_backend_dev_init(dev, nullptr);
+        if (!result.backend) {
+            continue;
+        }
+
+        result.type = BackendType::Metal;
+        result.is_gpu = true;
+        result.name = ggml_backend_dev_name(dev);
+        result.description = ggml_backend_dev_description(dev);
+        return result;
+    }
+
+    return result;
+}
+
 BackendInitResult init_cuda_backend() {
     BackendInitResult result;
 
@@ -182,6 +224,16 @@ BackendInitResult init_requested_backend(BackendType type, int n_threads) {
             return result;
         }
 
+        case BackendType::Metal: {
+            BackendInitResult result = init_metal_backend();
+            if (!result.backend) {
+                throw Error(ErrorCode::BackendError,
+                            "Failed to initialize Metal backend. Check that VoxCPM was built on "
+                            "Apple hardware with GGML_METAL=ON.");
+            }
+            return result;
+        }
+
         case BackendType::Vulkan: {
             BackendInitResult result = init_vulkan_backend();
             if (!result.backend) {
@@ -194,6 +246,10 @@ BackendInitResult init_requested_backend(BackendType type, int n_threads) {
 
         case BackendType::Auto: {
             BackendInitResult result = init_cuda_backend();
+            if (result.backend) {
+                return result;
+            }
+            result = init_metal_backend();
             if (result.backend) {
                 return result;
             }

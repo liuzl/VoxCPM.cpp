@@ -289,13 +289,16 @@ BackendType parse_backend_type(const std::string& value) {
     if (value == "cuda") {
         return BackendType::CUDA;
     }
+    if (value == "metal") {
+        return BackendType::Metal;
+    }
     if (value == "vulkan") {
         return BackendType::Vulkan;
     }
     if (value == "auto") {
         return BackendType::Auto;
     }
-    fail("Unsupported backend: " + value + " (expected cpu, cuda, vulkan, or auto)");
+    fail("Unsupported backend: " + value + " (expected cpu, cuda, metal, vulkan, or auto)");
 }
 
 void print_usage(const char* argv0) {
