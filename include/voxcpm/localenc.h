@@ -55,6 +55,8 @@ public:
 
 private:
     bool init_scratch_cache(VoxCPMBackend& backend);
+    ggml_tensor* forward_sequence_looped(VoxCPMContext& ctx, ggml_tensor* input);
+    bool ensure_batch_constants(int64_t patch_size, int64_t seq_len);
 
     LocEncWeights weights_;
     MiniCPMModel encoder_;
@@ -66,6 +68,17 @@ private:
     VoxCPMBackend* backend_ = nullptr;
     std::unique_ptr<MiniCPMKVCache> scratch_kv_cache_;
     std::shared_ptr<VoxCPMWeightStore> shared_store_;
+
+    // Constants for the batched forward_sequence path: per-token RoPE positions
+    // restarting at each patch, and a block-diagonal attention mask isolating
+    // patches. Rebuilt when (patch_size, seq_len) changes, mirroring the
+    // LocDiT cfg-pair constants lifecycle.
+    ggml_context* batch_ctx_ = nullptr;
+    ggml_backend_buffer_t batch_buffer_ = nullptr;
+    ggml_tensor* batch_positions_ = nullptr;
+    ggml_tensor* batch_attention_mask_ = nullptr;
+    int64_t batch_patch_size_ = 0;
+    int64_t batch_seq_len_ = 0;
 };
 
 }  // namespace voxcpm

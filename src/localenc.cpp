@@ -8,13 +8,29 @@
 #include "voxcpm/backend.h"
 #include "voxcpm/weight-store.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
 namespace voxcpm {
+
+namespace {
+constexpr float kLocEncBatchMaskNeg = -1.0e9f;
+}  // namespace
 
 LocEncModel::~LocEncModel() {
     scratch_kv_cache_.reset();
 
+    if (batch_buffer_) {
+        ggml_backend_buffer_free(batch_buffer_);
+        batch_buffer_ = nullptr;
+    }
+    if (batch_ctx_) {
+        ggml_free(batch_ctx_);
+        batch_ctx_ = nullptr;
+    }
     if (weight_buffer_) {
         ggml_backend_buffer_free(weight_buffer_);
         weight_buffer_ = nullptr;
@@ -108,6 +124,75 @@ ggml_tensor* LocEncModel::forward_patch(VoxCPMContext& ctx, ggml_tensor* input) 
     return ggml_view_1d(raw, output, hidden_size, 0);
 }
 
+bool LocEncModel::ensure_batch_constants(int64_t patch_size, int64_t seq_len) {
+    VOXCPM_ASSERT(patch_size > 0);
+    VOXCPM_ASSERT(seq_len > 0);
+    VOXCPM_ASSERT(backend_ != nullptr);
+
+    if (batch_patch_size_ == patch_size && batch_seq_len_ == seq_len &&
+        batch_positions_ != nullptr && batch_attention_mask_ != nullptr) {
+        return true;
+    }
+
+    if (batch_buffer_) {
+        backend_->free_buffer(batch_buffer_);
+        batch_buffer_ = nullptr;
+    }
+    if (batch_ctx_) {
+        ggml_free(batch_ctx_);
+        batch_ctx_ = nullptr;
+    }
+    batch_positions_ = nullptr;
+    batch_attention_mask_ = nullptr;
+    batch_patch_size_ = 0;
+    batch_seq_len_ = 0;
+
+    ggml_init_params params = {
+        .mem_size = ggml_tensor_overhead() * 2 + 1024,
+        .mem_buffer = nullptr,
+        .no_alloc = true,
+    };
+    batch_ctx_ = ggml_init(params);
+    if (!batch_ctx_) {
+        return false;
+    }
+
+    const int64_t tokens_per_patch = patch_size + 1;
+    const int64_t total_tokens = tokens_per_patch * seq_len;
+    batch_positions_ = ggml_new_tensor_1d(batch_ctx_, GGML_TYPE_I32, total_tokens);
+    batch_attention_mask_ = ggml_new_tensor_2d(batch_ctx_, GGML_TYPE_F16, total_tokens, total_tokens);
+    if (!batch_positions_ || !batch_attention_mask_) {
+        return false;
+    }
+
+    batch_buffer_ = backend_->alloc_buffer(batch_ctx_, BufferUsage::Weights);
+    if (!batch_buffer_) {
+        return false;
+    }
+
+    std::vector<int32_t> positions(static_cast<size_t>(total_tokens));
+    for (int64_t i = 0; i < total_tokens; ++i) {
+        positions[static_cast<size_t>(i)] = static_cast<int32_t>(i % tokens_per_patch);
+    }
+    backend_->tensor_set(batch_positions_, positions.data(), 0, positions.size() * sizeof(int32_t));
+
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t neg = ggml_fp32_to_fp16(kLocEncBatchMaskNeg);
+    std::vector<ggml_fp16_t> mask(static_cast<size_t>(total_tokens) * static_cast<size_t>(total_tokens), neg);
+    for (int64_t p = 0; p < seq_len; ++p) {
+        const int64_t base = p * tokens_per_patch;
+        for (int64_t row = base; row < base + tokens_per_patch; ++row) {
+            ggml_fp16_t* row_data = mask.data() + static_cast<size_t>(row) * static_cast<size_t>(total_tokens);
+            std::fill(row_data + base, row_data + base + tokens_per_patch, zero);
+        }
+    }
+    backend_->tensor_set(batch_attention_mask_, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+
+    batch_patch_size_ = patch_size;
+    batch_seq_len_ = seq_len;
+    return true;
+}
+
 ggml_tensor* LocEncModel::forward_sequence(VoxCPMContext& ctx, ggml_tensor* input) {
     VOXCPM_ASSERT(input != nullptr);
     VOXCPM_ASSERT(backend_ != nullptr);
@@ -123,6 +208,57 @@ ggml_tensor* LocEncModel::forward_sequence(VoxCPMContext& ctx, ggml_tensor* inpu
 
     VOXCPM_ASSERT(patch_size + 1 <= config().max_length);
     VOXCPM_ASSERT(input->ne[0] == feat_dim_ || input->ne[0] == hidden_size);
+
+    // Batch all patches through one encoder forward: patches are concatenated
+    // along the sequence axis, isolated by a block-diagonal attention mask,
+    // with RoPE positions restarting at every patch. This replaces seq_len
+    // separate 8-layer forwards (whose tiny per-patch kernels made prefill
+    // dispatch-bound) with one wide pass. VOXCPM_LOCENC_SEQUENTIAL=1 restores
+    // the per-patch loop.
+    const int64_t tokens_per_patch = patch_size + 1;
+    const int64_t total_tokens = tokens_per_patch * seq_len;
+    const char* force_seq = std::getenv("VOXCPM_LOCENC_SEQUENTIAL");
+    const bool use_batched = !(force_seq && *force_seq && std::strcmp(force_seq, "0") != 0) &&
+                             total_tokens <= scratch_kv_cache_->max_length() &&
+                             ensure_batch_constants(patch_size, seq_len);
+    if (!use_batched) {
+        return forward_sequence_looped(ctx, input);
+    }
+
+    ggml_tensor* projected = input;
+    if (input->ne[0] != hidden_size) {
+        projected = ggml_mul_mat(raw, weights_.in_proj_weight, input);
+        projected = ggml_add(raw, projected, weights_.in_proj_bias);
+    }
+
+    ggml_tensor* cls = ggml_reshape_3d(raw, weights_.special_token, hidden_size, 1, 1);
+    ggml_tensor* cls_shape = ggml_new_tensor_3d(raw, GGML_TYPE_F32, hidden_size, 1, seq_len);
+    ggml_tensor* cls_seq = ggml_repeat(raw, cls, cls_shape);
+    ggml_tensor* full_input = ggml_concat(raw, cls_seq, projected, 1);
+    ggml_tensor* flat_input = ggml_reshape_2d(raw, full_input, hidden_size, total_tokens);
+
+    ggml_tensor* hidden = encoder_.forward(ctx,
+                                           flat_input,
+                                           batch_positions_,
+                                           *scratch_kv_cache_,
+                                           false,
+                                           false,
+                                           batch_attention_mask_);
+
+    ggml_tensor* cls_out = ggml_view_2d(raw,
+                                        hidden,
+                                        hidden_size,
+                                        seq_len,
+                                        static_cast<size_t>(tokens_per_patch) * hidden->nb[1],
+                                        0);
+    return ggml_cont(raw, cls_out);
+}
+
+ggml_tensor* LocEncModel::forward_sequence_looped(VoxCPMContext& ctx, ggml_tensor* input) {
+    ggml_context* raw = ctx.raw_context();
+    const int64_t patch_size = input->ne[1];
+    const int64_t seq_len = input->ne[2];
+    const int hidden_size = config().hidden_size;
 
     ggml_tensor* output = ggml_new_tensor_2d(raw, GGML_TYPE_F32, hidden_size, seq_len);
     ggml_tensor* sync = nullptr;
@@ -149,7 +285,7 @@ ggml_tensor* LocEncModel::forward_sequence(VoxCPMContext& ctx, ggml_tensor* inpu
     }
 
     sync = ggml_scale(raw, sync, 0.0f);
-    return ggml_add1(raw, output, sync);
+    return ggml_add(raw, output, sync);
 }
 
 }  // namespace voxcpm

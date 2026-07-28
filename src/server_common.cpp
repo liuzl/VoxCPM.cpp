@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -791,6 +793,20 @@ void VoxCPMServiceCore::load() {
     }
 
     backend_ = std::make_unique<VoxCPMBackend>(backend_type_, threads_);
+
+    // AudioVAE runs on the main backend by default. VOXCPM_VAE_ON_CPU=1
+    // routes its graphs to a dedicated CPU backend instead — the escape
+    // hatch for the 2026-07-28 AGX incident class (pathological Metal
+    // kernels); the rewritten conv_transpose_1d has since passed on-device
+    // validation. The VAE weights stay in the main backend's shared buffer,
+    // which is host-addressable on Apple Silicon, so nothing is loaded twice.
+    const char* vae_on_cpu = std::getenv("VOXCPM_VAE_ON_CPU");
+    const bool vae_on_cpu_enabled = vae_on_cpu && *vae_on_cpu && std::strcmp(vae_on_cpu, "0") != 0;
+    if (backend_->type() == BackendType::Metal && vae_on_cpu_enabled) {
+        vae_backend_ = std::make_unique<VoxCPMBackend>(BackendType::CPU, threads_);
+        std::cerr << "AudioVAE backend: cpu (VOXCPM_VAE_ON_CPU=1)\n";
+    }
+
     store_ = std::make_shared<VoxCPMWeightStore>();
     if (!store_->load_from_file(model_path_, *backend_)) {
         fail("Failed to load GGUF: " + model_path_);
@@ -846,7 +862,7 @@ PromptFeatures VoxCPMServiceCore::encode_prompt_audio_locked(const std::string& 
     features.id = id;
     features.prompt_text = prompt_text;
     features.prompt_feat = extract_prompt_features(audio_vae_,
-                                                   *backend_,
+                                                   audio_vae_backend(),
                                                    resampled,
                                                    audio_vae_.config().sample_rate,
                                                    patch_size_value,
@@ -881,7 +897,7 @@ PromptFeatures VoxCPMServiceCore::encode_reference_audio_locked(const std::strin
     PromptFeatures features;
     features.id = id;
     features.reference_feat = extract_prompt_features(audio_vae_,
-                                                      *backend_,
+                                                      audio_vae_backend(),
                                                       resampled,
                                                       audio_vae_.config().sample_rate,
                                                       patch_size_value,
@@ -1058,7 +1074,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                     if (recent_frame_count > 0) {
                         std::vector<float> chunk_waveform =
                             decode_audio_from_output_pool(audio_vae_,
-                                                          *backend_,
+                                                          audio_vae_backend(),
                                                           *state.output_pool,
                                                           frame_offset,
                                                           recent_frame_count,
@@ -1080,7 +1096,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                     recent_frame_count = static_cast<int>(stream_recent_frames.size() / frame_stride);
                     if (recent_frame_count > 0) {
                         std::vector<float> chunk_waveform = decode_audio_from_patch_major_frames(audio_vae_,
-                                                                                                 *backend_,
+                                                                                                 audio_vae_backend(),
                                                                                                  stream_recent_frames,
                                                                                                  patch_size_value,
                                                                                                  feat_dim_value);
@@ -1132,7 +1148,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
         std::vector<float> waveform;
         std::vector<float> latent;
         const bool use_stateful_final_audio_decode =
-            should_use_stateful_audio_decode(*backend_, audio_vae_, total_patches);
+            should_use_stateful_audio_decode(audio_vae_backend(), audio_vae_, total_patches);
         const int decode_stateful_chunk_frames =
             stateful_audio_decode_chunk_frames(audio_vae_, patch_size_value);
         if (use_output_pool_timeline &&
@@ -1160,7 +1176,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
             }
             if (waveform.empty()) {
                 waveform = decode_audio_from_output_pool(audio_vae_,
-                                                         *backend_,
+                                                         audio_vae_backend(),
                                                          *state.output_pool,
                                                          frame_offset,
                                                          total_frames,
@@ -1197,7 +1213,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                                                       patch_size_value,
                                                       feat_dim_value,
                                                       &prepended_context_frames);
-                waveform = decode_audio(audio_vae_, *backend_, latent, total_patches, feat_dim_value);
+                waveform = decode_audio(audio_vae_, audio_vae_backend(), latent, total_patches, feat_dim_value);
             }
         }
         if (has_prompt_audio) {

@@ -289,13 +289,16 @@ BackendType parse_backend_type(const std::string& value) {
     if (value == "cuda") {
         return BackendType::CUDA;
     }
+    if (value == "metal") {
+        return BackendType::Metal;
+    }
     if (value == "vulkan") {
         return BackendType::Vulkan;
     }
     if (value == "auto") {
         return BackendType::Auto;
     }
-    fail("Unsupported backend: " + value + " (expected cpu, cuda, vulkan, or auto)");
+    fail("Unsupported backend: " + value + " (expected cpu, cuda, metal, vulkan, or auto)");
 }
 
 void print_usage(const char* argv0) {
@@ -1245,6 +1248,20 @@ int main(int argc, char** argv) {
             std::cerr << " | " << backend.backend_description();
         }
         std::cerr << ")\n";
+
+        // AudioVAE runs on the main backend by default. VOXCPM_VAE_ON_CPU=1
+        // routes its graphs to a dedicated CPU backend instead — the escape
+        // hatch for the 2026-07-28 AGX incident class (pathological Metal
+        // kernels); the rewritten conv_transpose_1d has since passed
+        // on-device validation. The VAE weights stay in the main backend's
+        // shared buffer, which is host-addressable on Apple Silicon, so
+        // nothing is loaded twice.
+        std::unique_ptr<VoxCPMBackend> vae_backend_holder;
+        if (backend.type() == BackendType::Metal && env_flag_enabled("VOXCPM_VAE_ON_CPU")) {
+            vae_backend_holder = std::make_unique<VoxCPMBackend>(BackendType::CPU, options.threads);
+            std::cerr << "AudioVAE backend: cpu (VOXCPM_VAE_ON_CPU=1)\n";
+        }
+        VoxCPMBackend& vae_backend = vae_backend_holder ? *vae_backend_holder : backend;
         std::cerr << "Loading GGUF from " << options.model_path << " with " << options.threads
                   << " threads...\n";
         auto store = std::make_shared<VoxCPMWeightStore>();
@@ -1286,7 +1303,7 @@ int main(int argc, char** argv) {
             }
         }
         const PreparedInputs prepared = prepare_inputs(
-            options, effective_text, split_tokenizer, audio_vae, backend, patch_size, feat_dim, encode_patch_len);
+            options, effective_text, split_tokenizer, audio_vae, vae_backend, patch_size, feat_dim, encode_patch_len);
         const auto encode_end = std::chrono::steady_clock::now();
         const double vae_encode_time = std::chrono::duration<double>(encode_end - encode_start).count();
 
@@ -1330,7 +1347,8 @@ int main(int argc, char** argv) {
                                          options.cfg_value);
             }
 
-            std::mt19937 rng(std::random_device{}());
+            const int noise_seed = env_nonnegative_int_or_default("VOXCPM_SEED", -1);
+            std::mt19937 rng(noise_seed >= 0 ? static_cast<uint32_t>(noise_seed) : std::random_device{}());
             std::vector<float> generated_steps;
             generated_steps.reserve(static_cast<size_t>(max_len) * patch_size * feat_dim);
             std::vector<float> noise;
@@ -1358,12 +1376,22 @@ int main(int argc, char** argv) {
             std::cerr << "...\n";
             DecodeProgressPrinter decode_progress(max_len);
             int stop_step_observed = -1;
+            const bool log_outer_step_timing = env_flag_enabled("VOXCPM_LOG_OUTER_STEP_TIMING");
             for (int step = 0; step < max_len; ++step) {
+                const auto outer_t0 = std::chrono::steady_clock::now();
                 fill_noise(noise, patch_size, feat_dim, rng);
+                const auto outer_t1 = std::chrono::steady_clock::now();
                 VoxCPMDecodeResult result = runtime.decode(std::move(state),
                                                            noise,
                                                            options.inference_timesteps,
                                                            options.cfg_value);
+                if (log_outer_step_timing) {
+                    const auto outer_t2 = std::chrono::steady_clock::now();
+                    fprintf(stderr,
+                            "[outer_step] noise_ms=%.2f decode_ms=%.2f\n",
+                            std::chrono::duration<double, std::milli>(outer_t1 - outer_t0).count(),
+                            std::chrono::duration<double, std::milli>(outer_t2 - outer_t1).count());
+                }
                 generated_steps.insert(generated_steps.end(), result.output_0.begin(), result.output_0.end());
                 state = std::move(result.output_1);
                 decode_progress.render(step + 1);
@@ -1386,7 +1414,7 @@ int main(int argc, char** argv) {
                     const int recent_patches = recent_frame_count * patch_size;
                     if (recent_patches > 0) {
                         patch_major_to_latent(stream_recent_frames, patch_size, feat_dim, stream_latent);
-                        std::vector<float> chunk_waveform = decode_audio(audio_vae, backend, stream_latent, recent_patches, feat_dim);
+                        std::vector<float> chunk_waveform = decode_audio(audio_vae, vae_backend, stream_latent, recent_patches, feat_dim);
                         if (chunk_waveform.size() > static_cast<size_t>(decode_patch_len)) {
                             chunk_waveform.erase(chunk_waveform.begin(),
                                                  chunk_waveform.end() - static_cast<std::ptrdiff_t>(decode_patch_len));
@@ -1446,7 +1474,7 @@ int main(int argc, char** argv) {
 
             const auto decode_start = std::chrono::steady_clock::now();
             const bool use_stateful_audio_decode =
-                should_use_stateful_audio_decode(backend, audio_vae, total_patches);
+                should_use_stateful_audio_decode(vae_backend, audio_vae, total_patches);
             const int decode_stateful_chunk_frames = stateful_audio_decode_chunk_frames(audio_vae, patch_size);
             const bool use_output_pool_final_audio_decode =
                 !disable_output_pool_final_decode &&
@@ -1507,7 +1535,7 @@ int main(int argc, char** argv) {
                 } else {
                     latent = patch_major_to_latent(decode_frames, patch_size, feat_dim);
                 }
-                waveform = decode_audio(audio_vae, backend, latent, total_patches, feat_dim);
+                waveform = decode_audio(audio_vae, vae_backend, latent, total_patches, feat_dim);
             }
             const auto decode_end = std::chrono::steady_clock::now();
             vae_decode_time = std::chrono::duration<double>(decode_end - decode_start).count();
@@ -1516,7 +1544,11 @@ int main(int argc, char** argv) {
         }
 
         const auto model_end = std::chrono::steady_clock::now();
-        const double model_time = std::chrono::duration<double>(model_end - model_start).count();
+        // The model span above includes the in-loop decode_audio call, which is
+        // already reported separately as vae_decode_time — subtract it so the
+        // breakdown lines are disjoint and Total does not double-count the VAE.
+        const double model_time =
+            std::chrono::duration<double>(model_end - model_start).count() - vae_decode_time;
         log_memory_breakdown(log_memory, "post_waveform_decode", *store, backend, &final_state);
         if (prepared.has_prompt_audio) {
             const size_t trim = static_cast<size_t>(decode_patch_len) * static_cast<size_t>(prepended_context_frames);

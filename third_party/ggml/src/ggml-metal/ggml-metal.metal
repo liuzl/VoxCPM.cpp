@@ -3645,6 +3645,7 @@ kernel void kernel_mul_mv_t_t(
 typedef decltype(kernel_mul_mv_t_t<half, half>) mul_mv_t_t;
 
 template [[host_name("kernel_mul_mv_f32_f32")]]   kernel mul_mv_t_t kernel_mul_mv_t_t<float, float>;
+template [[host_name("kernel_mul_mv_f32_f16")]]   kernel mul_mv_t_t kernel_mul_mv_t_t<float, half>;
 template [[host_name("kernel_mul_mv_f16_f32")]]   kernel mul_mv_t_t kernel_mul_mv_t_t<half,  float>;
 template [[host_name("kernel_mul_mv_f16_f16")]]   kernel mul_mv_t_t kernel_mul_mv_t_t<half,  half>;
 #if defined(GGML_METAL_HAS_BF16)
@@ -3769,6 +3770,7 @@ kernel void kernel_mul_mv_t_t_4(
 typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 
 template [[host_name("kernel_mul_mv_f32_f32_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
+template [[host_name("kernel_mul_mv_f32_f16_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, half,  half4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
 template [[host_name("kernel_mul_mv_f16_f16_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  half,  half4>;
 #if defined(GGML_METAL_HAS_BF16)
@@ -3834,6 +3836,7 @@ kernel void kernel_mul_mv_t_t_short(
 typedef decltype(kernel_mul_mv_t_t_short<half, half>) mul_mv_t_t_short_t;
 
 template [[host_name("kernel_mul_mv_f32_f32_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<float, float>;
+template [[host_name("kernel_mul_mv_f32_f16_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<float, half>;
 template [[host_name("kernel_mul_mv_f16_f32_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<half,  float>;
 template [[host_name("kernel_mul_mv_f16_f16_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<half,  half>;
 #if defined(GGML_METAL_HAS_BF16)
@@ -4392,8 +4395,12 @@ typedef void (conv_transpose_1d_t)(
         device const float * src1,
         device        char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
-        uint3    tgpg[[threadgroups_per_grid]]);
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]);
 
+// One thread per output element (ol, oc). Only input positions i with
+// i*s0 <= ol < i*s0 + K contribute, so the inner loop covers just those
+// ceil(K/s0) positions instead of scanning the whole input length.
 template <typename T>
 kernel void kernel_conv_transpose_1d(
         constant ggml_metal_kargs_conv_transpose_1d & args,
@@ -4401,22 +4408,31 @@ kernel void kernel_conv_transpose_1d(
         device const float * src1,
         device        char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
-        uint3   tgpg[[threadgroups_per_grid]]) {
+        uint3   tpitg[[thread_position_in_threadgroup]],
+        uint3     ntg[[threads_per_threadgroup]]) {
+
+    const int32_t ol = tgpig[0] * ntg[0] + tpitg[0];
+    const int32_t oc = tgpig[1];
+
+    if (ol >= args.OL) {
+        return;
+    }
+
+    const int32_t i0 = ol >= args.K ? (ol - args.K) / args.s0 + 1 : 0;
+    const int32_t i1 = min(ol / args.s0, args.IL - 1);
 
     float v = 0.0f;
 
-    for (int64_t c = 0; c < args.IC; c++) {
-        const int32_t kernel_offset = c * tgpg[1] * args.K + args.K * tgpig[1];
-        const int32_t input_offset = c * args.IL;
+    for (int32_t c = 0; c < args.IC; c++) {
+        const int32_t kernel_offset = (c * args.OC + oc) * args.K;
+        const int32_t input_offset  = c * args.IL;
 
-        for (int64_t i = 0; i < args.IL; i++) {
-            if (tgpig[0] >= i * args.s0 && tgpig[0] < i * args.s0 + args.K) {
-                v += src0[kernel_offset + tgpig[0] - i * args.s0] * src1[input_offset + i];
-            }
+        for (int32_t i = i0; i <= i1; i++) {
+            v += (float) src0[kernel_offset + ol - i * args.s0] * src1[input_offset + i];
         }
     }
 
-    device float * dst_ptr = (device float *) (dst + tgpig[0] * args.nb0 + tgpig[1] * args.nb1);
+    device float * dst_ptr = (device float *) (dst + ol * args.nb0 + oc * args.nb1);
 
     dst_ptr[0] = v;
 }
@@ -4428,7 +4444,8 @@ kernel void kernel_conv_transpose_1d<float>(
     device const float * src1,
     device        char * dst,
     uint3   tgpig[[threadgroup_position_in_grid]],
-    uint3    tgpg[[threadgroups_per_grid]]);
+    uint3   tpitg[[thread_position_in_threadgroup]],
+    uint3     ntg[[threads_per_threadgroup]]);
 
 template [[host_name("kernel_conv_transpose_1d_f16_f32")]]
 kernel void kernel_conv_transpose_1d<half>(
@@ -4437,7 +4454,8 @@ kernel void kernel_conv_transpose_1d<half>(
     device const float * src1,
     device        char * dst,
     uint3   tgpig[[threadgroup_position_in_grid]],
-    uint3    tgpg[[threadgroups_per_grid]]);
+    uint3   tpitg[[thread_position_in_threadgroup]],
+    uint3     ntg[[threads_per_threadgroup]]);
 
 
 typedef void (conv_transpose_2d_t)(
