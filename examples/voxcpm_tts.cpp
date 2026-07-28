@@ -1376,12 +1376,22 @@ int main(int argc, char** argv) {
             std::cerr << "...\n";
             DecodeProgressPrinter decode_progress(max_len);
             int stop_step_observed = -1;
+            const bool log_outer_step_timing = env_flag_enabled("VOXCPM_LOG_OUTER_STEP_TIMING");
             for (int step = 0; step < max_len; ++step) {
+                const auto outer_t0 = std::chrono::steady_clock::now();
                 fill_noise(noise, patch_size, feat_dim, rng);
+                const auto outer_t1 = std::chrono::steady_clock::now();
                 VoxCPMDecodeResult result = runtime.decode(std::move(state),
                                                            noise,
                                                            options.inference_timesteps,
                                                            options.cfg_value);
+                if (log_outer_step_timing) {
+                    const auto outer_t2 = std::chrono::steady_clock::now();
+                    fprintf(stderr,
+                            "[outer_step] noise_ms=%.2f decode_ms=%.2f\n",
+                            std::chrono::duration<double, std::milli>(outer_t1 - outer_t0).count(),
+                            std::chrono::duration<double, std::milli>(outer_t2 - outer_t1).count());
+                }
                 generated_steps.insert(generated_steps.end(), result.output_0.begin(), result.output_0.end());
                 state = std::move(result.output_1);
                 decode_progress.render(step + 1);
@@ -1534,7 +1544,11 @@ int main(int argc, char** argv) {
         }
 
         const auto model_end = std::chrono::steady_clock::now();
-        const double model_time = std::chrono::duration<double>(model_end - model_start).count();
+        // The model span above includes the in-loop decode_audio call, which is
+        // already reported separately as vae_decode_time — subtract it so the
+        // breakdown lines are disjoint and Total does not double-count the VAE.
+        const double model_time =
+            std::chrono::duration<double>(model_end - model_start).count() - vae_decode_time;
         log_memory_breakdown(log_memory, "post_waveform_decode", *store, backend, &final_state);
         if (prepared.has_prompt_audio) {
             const size_t trim = static_cast<size_t>(decode_patch_len) * static_cast<size_t>(prepended_context_frames);

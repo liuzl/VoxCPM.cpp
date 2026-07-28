@@ -2275,8 +2275,11 @@ VoxCPMDecodeState VoxCPMRuntime::prefill_impl(const std::vector<int32_t>& text,
     }
     VOXCPM_ASSERT(static_cast<int>(feat_mask.size()) == seq_len);
     const bool lazy_host_state = env_flag_enabled("VOXCPM_LAZY_HOST_STATE");
+    const bool log_prefill_timing = env_flag_enabled("VOXCPM_LOG_PREFILL_TIMING");
+    const auto pf_t0 = std::chrono::steady_clock::now();
 
     VoxCPMDecodeState state = create_decode_state_internal(false);
+    const auto pf_t_state = std::chrono::steady_clock::now();
     state.streaming_prefix_len = streaming_prefix_len;
     const bool persistent_only_prefill = lazy_host_state &&
                                          state.persistent_state != nullptr &&
@@ -2366,6 +2369,7 @@ VoxCPMDecodeState VoxCPMRuntime::prefill_impl(const std::vector<int32_t>& text,
                 backend_->alloc_buffer(combined_ctx.raw_context(), BufferUsage::Compute);
             VOXCPM_ASSERT(combined_buffer != nullptr);
 
+            const auto pf_t_embed0 = std::chrono::steady_clock::now();
             if (feat_src != nullptr) {
                 run_embedding_masked_locenc_sequence_to_lm_projection_from_feat_tensor_into(text,
                                                                                             feat_src,
@@ -2380,6 +2384,12 @@ VoxCPMDecodeState VoxCPMRuntime::prefill_impl(const std::vector<int32_t>& text,
                                                                            feat_mask_f,
                                                                            seq_len,
                                                                            combined_embed_tensor);
+            }
+            if (log_prefill_timing) {
+                const auto pf_t_embed1 = std::chrono::steady_clock::now();
+                fprintf(stderr,
+                        "[prefill_timing] embed_locenc_ms=%.2f\n",
+                        std::chrono::duration<double, std::milli>(pf_t_embed1 - pf_t_embed0).count());
             }
             run_prefill_hidden_states_from_tensor_into(combined_embed_tensor,
                                                        text_mask_f,
@@ -2440,6 +2450,8 @@ VoxCPMDecodeState VoxCPMRuntime::prefill_impl(const std::vector<int32_t>& text,
                 run_minicpm_forward_last_hidden(residual_lm_, residual_inputs, seq_len, *state.residual_lm_cache, true);
         }
     }
+
+    const auto pf_t_hidden = std::chrono::steady_clock::now();
 
     int audio_frame_count = 0;
     const float* last_prompt_patch = nullptr;
@@ -2519,6 +2531,7 @@ VoxCPMDecodeState VoxCPMRuntime::prefill_impl(const std::vector<int32_t>& text,
             audio_frame_count += span_count;
         }
     }
+    const auto pf_t_prompt = std::chrono::steady_clock::now();
 
     if (!persistent_only_prefill) {
         state.lm_hidden = std::move(lm_hidden);
@@ -2551,6 +2564,20 @@ VoxCPMDecodeState VoxCPMRuntime::prefill_impl(const std::vector<int32_t>& text,
         state.lm_hidden.clear();
         state.residual_hidden.clear();
         state.prefix_feat_cond.clear();
+    }
+    if (log_prefill_timing) {
+        const auto pf_t_end = std::chrono::steady_clock::now();
+        const auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        fprintf(stderr,
+                "[prefill_timing] seq_len=%d state_ms=%.2f hidden_ms=%.2f prompt_ms=%.2f finalize_ms=%.2f total_ms=%.2f\n",
+                seq_len,
+                ms(pf_t0, pf_t_state),
+                ms(pf_t_state, pf_t_hidden),
+                ms(pf_t_hidden, pf_t_prompt),
+                ms(pf_t_prompt, pf_t_end),
+                ms(pf_t0, pf_t_end));
     }
     return state;
 }
