@@ -68,11 +68,22 @@ static bool ggml_backend_metal_buffer_shared_cpy_tensor(ggml_backend_buffer_t bu
 
     GGML_ASSERT(ggml_metal_buffer_is_shared(ctx));
 
-    GGML_UNUSED(buffer);
-    GGML_UNUSED(src);
-    GGML_UNUSED(dst);
+    // Shared Metal buffers are CPU-addressable on Apple Silicon, so copies
+    // between them can move directly instead of falling back through an
+    // allocated host staging buffer in ggml_backend_tensor_copy(). Callers
+    // must have synchronized the backend; the tensor_get/tensor_set fallback
+    // has the same requirement. The source buffer must itself be shared —
+    // private Metal buffers carry fake virtual addresses in tensor->data —
+    // and both tensors must be contiguous for a flat memmove to be valid.
+    if (src->buffer == nullptr || src->data == nullptr || dst->data == nullptr ||
+        src->buffer->buft != buffer->buft ||
+        src->buffer->iface.cpy_tensor != ggml_backend_metal_buffer_shared_cpy_tensor ||
+        !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
 
-    return false;
+    memmove(dst->data, src->data, ggml_nbytes(src));
+    return true;
 }
 
 static void ggml_backend_metal_buffer_shared_clear(ggml_backend_buffer_t buffer, uint8_t value) {
