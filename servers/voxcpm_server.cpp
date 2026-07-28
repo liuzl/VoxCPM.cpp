@@ -51,9 +51,10 @@ struct RequestContext {
 BackendType parse_backend_type(const std::string& value) {
     if (value == "cpu") return BackendType::CPU;
     if (value == "cuda") return BackendType::CUDA;
+    if (value == "metal") return BackendType::Metal;
     if (value == "vulkan") return BackendType::Vulkan;
     if (value == "auto") return BackendType::Auto;
-    fail("Unsupported backend: " + value);
+    fail("Unsupported backend: " + value + " (expected cpu, cuda, metal, vulkan, or auto)");
 }
 
 Options parse_args(int argc, char** argv) {
