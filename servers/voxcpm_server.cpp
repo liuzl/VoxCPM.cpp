@@ -428,6 +428,31 @@ int main(int argc, char** argv) {
         VoiceStore voice_store(options.voice_dir);
         BoundedSynthesisQueue queue(options.max_queue);
 
+        // Warm up before accepting traffic: the first synthesis of a fresh
+        // process JIT-compiles dozens of Metal pipelines and would otherwise
+        // tax the first real request with 1-2s of stutter. Uses the first
+        // registered voice; skipped when the registry is empty.
+        {
+            const auto voices = voice_store.list_voices();
+            if (!voices.empty()) {
+                const auto warm_start = std::chrono::steady_clock::now();
+                try {
+                    SynthesisRequest request;
+                    request.text = "预热。";
+                    request.prompt = voice_store.load_voice(voices.front().id);
+                    request.max_decode_steps = options.max_decode_steps;
+                    request.inference_timesteps = options.inference_timesteps;
+                    core.synthesize(request);
+                    const double warm_s = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - warm_start).count();
+                    std::cerr << "Warmup synthesis (" << voices.front().id << ") done in "
+                              << warm_s << "s\n";
+                } catch (const std::exception& e) {
+                    std::cerr << "Warmup synthesis failed (continuing): " << e.what() << "\n";
+                }
+            }
+        }
+
         httplib::Server server;
         server.new_task_queue = [] { return new httplib::ThreadPool(8); };
 
