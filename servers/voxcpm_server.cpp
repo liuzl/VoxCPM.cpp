@@ -16,6 +16,10 @@
 #include <string>
 #include <thread>
 
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+
 namespace voxcpm {
 namespace {
 
@@ -405,6 +409,15 @@ private:
 }  // namespace voxcpm
 
 int main(int argc, char** argv) {
+#ifdef __APPLE__
+    // When launched as a launchd agent the process inherits background QoS,
+    // which schedules the decode loop's CPU-side orchestration (thousands of
+    // tiny Metal dispatches per second) onto efficiency cores — measured 6x
+    // slower than the same binary started from a terminal (RTF 3.7 vs 0.6).
+    // ProcessType=Interactive in the plist was not sufficient; claim
+    // user-interactive QoS explicitly. Worker and HTTP threads inherit it.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     using namespace voxcpm;
 
     try {
