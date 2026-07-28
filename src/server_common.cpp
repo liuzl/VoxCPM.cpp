@@ -769,6 +769,29 @@ VoiceMetadata VoiceStore::load_metadata(const std::string& id) const {
     };
 }
 
+std::vector<VoiceMetadata> VoiceStore::list_voices() const {
+    std::vector<VoiceMetadata> voices;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(root_dir_, ec)) {
+        if (!entry.is_directory()) {
+            continue;
+        }
+        const std::string id = entry.path().filename().string();
+        if (!is_valid_voice_id(id)) {
+            continue;
+        }
+        try {
+            voices.push_back(load_metadata(id));
+        } catch (const std::exception&) {
+            // Skip entries with missing or unreadable manifests.
+        }
+    }
+    std::sort(voices.begin(), voices.end(), [](const VoiceMetadata& a, const VoiceMetadata& b) {
+        return a.id < b.id;
+    });
+    return voices;
+}
+
 void VoiceStore::delete_voice(const std::string& id) {
     const auto dir = std::filesystem::path(root_dir_) / id;
     if (!std::filesystem::exists(dir)) {

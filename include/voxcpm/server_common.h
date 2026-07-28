@@ -71,6 +71,9 @@ public:
     void save_voice(const PromptFeatures& features);
     PromptFeatures load_voice(const std::string& id) const;
     VoiceMetadata load_metadata(const std::string& id) const;
+    // All registered voices with a readable manifest, sorted by id; unreadable
+    // entries are skipped.
+    std::vector<VoiceMetadata> list_voices() const;
     void delete_voice(const std::string& id);
 
     const std::string& root_dir() const { return root_dir_; }

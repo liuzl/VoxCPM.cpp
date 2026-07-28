@@ -260,6 +260,32 @@ RequestContext parse_request(const json& body, const Options& options) {
         ctx.seed = body["seed"].get<int64_t>();
     }
 
+    // Continuation-session fields are accepted for protocol parity with the
+    // Python voxcpm server and validated, but carry no state here: since its
+    // 2026-07-16 policy change, that server conditions chunks 2..N of a
+    // session on the voice anchor alone (merging prior chunks caused tempo
+    // drift), which for registered voices is exactly what independent
+    // requests with the same voice already do. Sessions only matter for
+    // reference-less (design) voices, which this server does not offer yet.
+    if (body.contains("continuation_id") && !body["continuation_id"].is_null()) {
+        if (!body["continuation_id"].is_string()) {
+            fail("`continuation_id` must be a string");
+        }
+        const std::string continuation_id = body["continuation_id"].get<std::string>();
+        if (continuation_id.empty() || continuation_id.size() > 96 ||
+            continuation_id.find_first_not_of(
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos) {
+            fail("`continuation_id` must contain only letters, digits, underscores, or hyphens");
+        }
+    }
+    if (body.contains("continuation_end") && !body["continuation_end"].is_null() &&
+        !body["continuation_end"].is_boolean()) {
+        fail("`continuation_end` must be a boolean");
+    }
+    // `prosody_prompt` is likewise accepted without effect: registered voices
+    // here always condition on the reference transcript together with the
+    // audio, which is the prosody_prompt=true behavior voxstudio requests.
+
     if (body.contains("max-attempts")) {
         ctx.max_attempts = body.value("max-attempts", options.max_attempts);
         if (ctx.sse && ctx.max_attempts != 1) fail("`sse` mode does not support multiple attempts");
@@ -434,6 +460,17 @@ int main(int argc, char** argv) {
             } catch (const std::exception& e) {
                 respond_error(res, 400, e.what(), "invalid_request_error", "bad_request");
             }
+        });
+
+        server.Get("/v1/voices", [&](const httplib::Request& req, httplib::Response& res) {
+            if (!authorize(options, req, res)) {
+                return;
+            }
+            json voices = json::array();
+            for (const VoiceMetadata& metadata : voice_store.list_voices()) {
+                voices.push_back(metadata_to_json(metadata));
+            }
+            respond_json(res, 200, {{"voices", voices}});
         });
 
         server.Get(R"(/v1/voices/([A-Za-z0-9._-]+))", [&](const httplib::Request& req, httplib::Response& res) {
