@@ -46,6 +46,9 @@ struct SynthesisRequest {
     PromptFeatures prompt;
     float cfg_value = 2.0f;
     int inference_timesteps = 10;
+    // Seeds the decode-noise RNG when >= 0 for reproducible synthesis;
+    // negative draws from std::random_device.
+    int64_t seed = -1;
     int streaming_prefix_len = 4;
     bool retry_badcase = false;
     int retry_badcase_max_times = 3;

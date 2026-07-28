@@ -1025,7 +1025,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
         std::cerr << "[tts] prefill done seq_len=" << seq_len << " attempt=" << (attempt + 1) << "\n";
         const bool use_output_pool_timeline = should_use_output_pool_timeline(state, has_reference_audio, seq_len);
 
-        std::mt19937 rng(std::random_device{}());
+        std::mt19937 rng(request.seed >= 0 ? static_cast<uint32_t>(request.seed) : std::random_device{}());
         std::vector<float> generated_steps;
         if (!use_output_pool_timeline) {
             generated_steps.reserve(static_cast<size_t>(max_len) * patch_size_value * feat_dim_value);

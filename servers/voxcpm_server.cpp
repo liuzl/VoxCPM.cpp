@@ -45,6 +45,9 @@ struct RequestContext {
     double speed = 1.0;
     bool sse = false;
     bool stream = false;
+    float cfg_value = 2.0f;
+    int timesteps = 0;
+    int64_t seed = -1;
     int max_attempts;
 };
 
@@ -239,6 +242,23 @@ RequestContext parse_request(const json& body, const Options& options) {
     // contract voxstudio's TtsClient.speechStream expects; `response_format`
     // is ignored on this path.
     ctx.stream = body.value("stream", false);
+
+    // Per-request generation controls, matching the Python voxcpm server's
+    // request surface. Fall back to the launch-flag defaults when absent.
+    ctx.cfg_value = body.value("cfg_value", 2.0f);
+    if (!(ctx.cfg_value > 0.0f && ctx.cfg_value <= 16.0f)) {
+        fail("`cfg_value` must be in (0, 16]");
+    }
+    ctx.timesteps = body.value("timesteps", options.inference_timesteps);
+    if (ctx.timesteps < 1 || ctx.timesteps > 100) {
+        fail("`timesteps` must be between 1 and 100");
+    }
+    if (body.contains("seed") && !body["seed"].is_null()) {
+        if (!body["seed"].is_number_integer() || body["seed"].get<int64_t>() < 0) {
+            fail("`seed` must be a non-negative integer");
+        }
+        ctx.seed = body["seed"].get<int64_t>();
+    }
 
     if (body.contains("max-attempts")) {
         ctx.max_attempts = body.value("max-attempts", options.max_attempts);
@@ -496,7 +516,9 @@ int main(int argc, char** argv) {
                     request.text = ctx.input;
                     request.prompt = std::move(prompt);
                     request.max_decode_steps = options.max_decode_steps;
-                    request.inference_timesteps = options.inference_timesteps;
+                    request.inference_timesteps = ctx.timesteps;
+                    request.cfg_value = ctx.cfg_value;
+                    request.seed = ctx.seed;
                     const int source_sample_rate = core.sample_rate();
                     const double speed = ctx.speed;
                     request.chunk_callback = [state, source_sample_rate, response_sample_rate, speed](
@@ -555,7 +577,9 @@ int main(int argc, char** argv) {
                     request.text = ctx.input;
                     request.prompt = std::move(prompt);
                     request.max_decode_steps = options.max_decode_steps;
-                    request.inference_timesteps = options.inference_timesteps;
+                    request.inference_timesteps = ctx.timesteps;
+                    request.cfg_value = ctx.cfg_value;
+                    request.seed = ctx.seed;
                     request.chunk_callback = [&](const std::vector<float>& chunk_waveform) {
                         const std::vector<float> prepared = prepare_response_waveform(chunk_waveform,
                                                                                       core.sample_rate(),
@@ -590,7 +614,9 @@ int main(int argc, char** argv) {
                 request.text = ctx.input;
                 request.prompt = std::move(prompt);
                 request.max_decode_steps = options.max_decode_steps;
-                request.inference_timesteps = options.inference_timesteps;
+                request.inference_timesteps = ctx.timesteps;
+                request.cfg_value = ctx.cfg_value;
+                request.seed = ctx.seed;
                 request.retry_badcase = (ctx.max_attempts == 1 ? false : true);
                 request.retry_badcase_max_times = std::min(ctx.max_attempts, options.max_attempts);
                 SynthesisResult result = core.synthesize(request);
