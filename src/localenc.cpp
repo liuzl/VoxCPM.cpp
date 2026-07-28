@@ -24,7 +24,13 @@ LocEncModel::~LocEncModel() {
     scratch_kv_cache_.reset();
 
     if (batch_buffer_) {
-        ggml_backend_buffer_free(batch_buffer_);
+        // The buffer is tracked by the backend's buffer list; free through it
+        // so teardown does not double-free (mirrors ~LocDiTModel).
+        if (backend_) {
+            backend_->free_buffer(batch_buffer_);
+        } else {
+            ggml_backend_buffer_free(batch_buffer_);
+        }
         batch_buffer_ = nullptr;
     }
     if (batch_ctx_) {

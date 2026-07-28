@@ -55,6 +55,9 @@ struct SynthesisRequest {
     float retry_badcase_ratio_threshold = 6.0f;
     int max_decode_steps = 0;
     std::function<void(const std::vector<float>&)> chunk_callback;
+    // Streaming consumers take audio exclusively from chunk_callback; skip the
+    // final whole-utterance AudioVAE decode and leave result.waveform empty.
+    bool skip_final_waveform = false;
 };
 
 struct SynthesisResult {

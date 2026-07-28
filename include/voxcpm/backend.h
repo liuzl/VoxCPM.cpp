@@ -277,11 +277,17 @@ public:
     bool is_valid() const { return backend_ != nullptr; }
 
 private:
+    // Selects the compute arena for a stage: AudioVAE stages get their own
+    // allocator so their (large, per-request) graphs never resize the arena
+    // that the cached LM step graphs point into.
+    ggml_gallocr_t& stage_allocator(const char* stage);
+
     BackendType type_;
     int n_threads_;
     ggml_backend_t backend_;
     ggml_backend_t cpu_backend_ = nullptr;
     ggml_gallocr_t gallocr_;
+    ggml_gallocr_t vae_gallocr_ = nullptr;
     ggml_backend_sched_t sched_ = nullptr;
     size_t sched_graph_size_ = 0;
     bool is_gpu_ = false;

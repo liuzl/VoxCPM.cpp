@@ -369,6 +369,9 @@ VoxCPMBackend::~VoxCPMBackend() {
     if (sched_) {
         ggml_backend_sched_free(sched_);
     }
+    if (vae_gallocr_) {
+        ggml_gallocr_free(vae_gallocr_);
+    }
     if (gallocr_) {
         ggml_gallocr_free(gallocr_);
     }
@@ -389,6 +392,7 @@ VoxCPMBackend::VoxCPMBackend(VoxCPMBackend&& other) noexcept
       backend_(other.backend_),
       cpu_backend_(other.cpu_backend_),
       gallocr_(other.gallocr_),
+      vae_gallocr_(other.vae_gallocr_),
       sched_(other.sched_),
       sched_graph_size_(other.sched_graph_size_),
       is_gpu_(other.is_gpu_),
@@ -401,6 +405,7 @@ VoxCPMBackend::VoxCPMBackend(VoxCPMBackend&& other) noexcept
     other.backend_ = nullptr;
     other.cpu_backend_ = nullptr;
     other.gallocr_ = nullptr;
+    other.vae_gallocr_ = nullptr;
     other.sched_ = nullptr;
     other.sched_graph_size_ = 0;
     other.is_gpu_ = false;
@@ -413,6 +418,7 @@ VoxCPMBackend& VoxCPMBackend::operator=(VoxCPMBackend&& other) noexcept {
         free_tracked_buffers(buffers_);
         if (sched_) ggml_backend_sched_free(sched_);
         if (gallocr_) ggml_gallocr_free(gallocr_);
+        if (vae_gallocr_) ggml_gallocr_free(vae_gallocr_);
         if (cpu_backend_) ggml_backend_free(cpu_backend_);
         if (backend_) ggml_backend_free(backend_);
 
@@ -422,6 +428,7 @@ VoxCPMBackend& VoxCPMBackend::operator=(VoxCPMBackend&& other) noexcept {
         backend_ = other.backend_;
         cpu_backend_ = other.cpu_backend_;
         gallocr_ = other.gallocr_;
+        vae_gallocr_ = other.vae_gallocr_;
         sched_ = other.sched_;
         sched_graph_size_ = other.sched_graph_size_;
         is_gpu_ = other.is_gpu_;
@@ -435,6 +442,7 @@ VoxCPMBackend& VoxCPMBackend::operator=(VoxCPMBackend&& other) noexcept {
         other.backend_ = nullptr;
         other.cpu_backend_ = nullptr;
         other.gallocr_ = nullptr;
+        other.vae_gallocr_ = nullptr;
         other.sched_ = nullptr;
         other.sched_graph_size_ = 0;
         other.is_gpu_ = false;
@@ -502,6 +510,26 @@ void VoxCPMBackend::reset_request_state() {
         ggml_gallocr_free(gallocr_);
         gallocr_ = nullptr;
     }
+    if (vae_gallocr_) {
+        ggml_gallocr_free(vae_gallocr_);
+        vae_gallocr_ = nullptr;
+    }
+}
+
+ggml_gallocr_t& VoxCPMBackend::stage_allocator(const char* stage) {
+    if (stage != nullptr && std::strstr(stage, "audio_vae") != nullptr) {
+        if (!vae_gallocr_) {
+            vae_gallocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+            if (!vae_gallocr_) {
+                throw Error(ErrorCode::OutOfMemory, "Failed to create AudioVAE graph allocator");
+            }
+        }
+        return vae_gallocr_;
+    }
+    if (!gallocr_) {
+        init_allocator();
+    }
+    return gallocr_;
 }
 
 void VoxCPMBackend::reserve_compute_memory(ggml_cgraph* graph, const char* stage) {
@@ -561,11 +589,9 @@ void VoxCPMBackend::reserve_compute_memory(ggml_cgraph* graph, const char* stage
         return;
     }
 
-    if (!gallocr_) {
-        init_allocator();
-    }
+    ggml_gallocr_t& stage_gallocr = stage_allocator(stage);
     const size_t before = compute_buffer_size();
-    ggml_gallocr_reserve(gallocr_, graph);
+    ggml_gallocr_reserve(stage_gallocr, graph);
     if (allocator_logging_enabled_) {
         const size_t after = compute_buffer_size();
         std::cerr << "[allocator] action=reserve"
@@ -610,11 +636,9 @@ void VoxCPMBackend::alloc_graph(ggml_cgraph* graph, const char* stage) {
         return;
     }
 
-    if (!gallocr_) {
-        init_allocator();
-    }
+    ggml_gallocr_t& stage_gallocr = stage_allocator(stage);
     const size_t before = compute_buffer_size();
-    ggml_gallocr_alloc_graph(gallocr_, graph);
+    ggml_gallocr_alloc_graph(stage_gallocr, graph);
     if (allocator_logging_enabled_) {
         const size_t after = compute_buffer_size();
         std::cerr << "[allocator] action=alloc"
@@ -712,6 +736,9 @@ size_t VoxCPMBackend::compute_buffer_size() const {
     }
     if (gallocr_) {
         total += ggml_gallocr_get_buffer_size(gallocr_, 0);
+    }
+    if (vae_gallocr_) {
+        total += ggml_gallocr_get_buffer_size(vae_gallocr_, 0);
     }
     return total;
 }

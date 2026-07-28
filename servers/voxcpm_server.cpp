@@ -556,6 +556,7 @@ int main(int argc, char** argv) {
                     request.inference_timesteps = ctx.timesteps;
                     request.cfg_value = ctx.cfg_value;
                     request.seed = ctx.seed;
+                    request.skip_final_waveform = true;
                     const int source_sample_rate = core.sample_rate();
                     const double speed = ctx.speed;
                     request.chunk_callback = [state, source_sample_rate, response_sample_rate, speed](
@@ -617,6 +618,7 @@ int main(int argc, char** argv) {
                     request.inference_timesteps = ctx.timesteps;
                     request.cfg_value = ctx.cfg_value;
                     request.seed = ctx.seed;
+                    request.skip_final_waveform = true;
                     request.chunk_callback = [&](const std::vector<float>& chunk_waveform) {
                         const std::vector<float> prepared = prepare_response_waveform(chunk_waveform,
                                                                                       core.sample_rate(),

@@ -336,6 +336,12 @@ std::vector<float> decode_audio_from_output_pool(AudioVAE& audio_vae,
         fail("Output pool shape does not match AudioVAE decode request");
     }
 
+    static const bool log_chunk_timing = [] {
+        const char* raw = std::getenv("VOXCPM_LOG_CHUNK_DECODE_TIMING");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    const auto t0 = std::chrono::steady_clock::now();
+
     VoxCPMContext graph_ctx(ContextType::Graph, 32768, 262144);
     ggml_tensor* latent = output_pool.make_audio_vae_latent_view(graph_ctx.raw_context(), frame_offset, frame_count);
     if (latent == nullptr) {
@@ -348,15 +354,30 @@ std::vector<float> decode_audio_from_output_pool(AudioVAE& audio_vae,
 
     ggml_cgraph* graph = graph_ctx.new_graph();
     graph_ctx.build_forward(graph, audio);
+    const auto t_build = std::chrono::steady_clock::now();
     backend.reserve_compute_memory(graph, "server.audio_vae.decode.output_pool");
     backend.alloc_graph(graph, "server.audio_vae.decode.output_pool");
+    const auto t_alloc = std::chrono::steady_clock::now();
     audio_vae.prepare_decode_inputs(backend);
     if (backend.compute(graph) != GGML_STATUS_SUCCESS) {
         fail("AudioVAE decode from output pool failed");
     }
+    const auto t_compute = std::chrono::steady_clock::now();
 
     std::vector<float> waveform(static_cast<size_t>(ggml_nelements(audio)));
     backend.tensor_get(audio, waveform.data(), 0, waveform.size() * sizeof(float));
+    if (log_chunk_timing) {
+        const auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        fprintf(stderr,
+                "[chunk_decode] frames=%d build_ms=%.2f alloc_ms=%.2f compute_ms=%.2f readback_ms=%.2f\n",
+                frame_count,
+                ms(t0, t_build),
+                ms(t_build, t_alloc),
+                ms(t_alloc, t_compute),
+                ms(t_compute, std::chrono::steady_clock::now()));
+    }
     return waveform;
 }
 
@@ -663,17 +684,6 @@ void append_stream_frame(std::vector<float>& recent_frames,
         recent_frames.erase(recent_frames.begin(),
                             recent_frames.begin() + static_cast<std::ptrdiff_t>(recent_frames.size() - max_elems));
     }
-}
-
-void clear_decode_graph_caches_after_streaming_audio_decode(VoxCPMRuntime& runtime,
-                                                            VoxCPMDecodeState& state) {
-    // Streaming AudioVAE chunk decode can resize the shared compute arena.
-    // Drop cached graph handles before the next decode step can reuse stale tensor data pointers.
-    runtime.reset_request_state();
-    state.base_lm_step_graph.clear();
-    state.residual_lm_step_graph.clear();
-    state.base_lm_step_graph_position = -1;
-    state.residual_lm_step_graph_position = -1;
 }
 
 }  // namespace
@@ -1071,6 +1081,36 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                                         request.prompt.prompt_feat.end());
         }
 
+        int pending_stream_frames = 0;
+        int emitted_stream_chunks = 0;
+        const int stream_cadence = std::max(1, env_int_or_default("VOXCPM_STREAM_CADENCE", 4));
+        const auto emit_pool_stream_chunk = [&]() {
+            if (pending_stream_frames <= 0) {
+                return;
+            }
+            const int recent = std::min(request.streaming_prefix_len - 1 + pending_stream_frames,
+                                        state.audio_frame_count);
+            const int frame_offset = state.audio_frame_count - recent;
+            if (recent <= 0) {
+                return;
+            }
+            std::vector<float> chunk_waveform = decode_audio_from_output_pool(audio_vae_,
+                                                                              audio_vae_backend(),
+                                                                              *state.output_pool,
+                                                                              frame_offset,
+                                                                              recent,
+                                                                              patch_size_value,
+                                                                              feat_dim_value);
+            const size_t keep = static_cast<size_t>(decode_patch_len) * static_cast<size_t>(pending_stream_frames);
+            if (chunk_waveform.size() > keep) {
+                chunk_waveform.erase(chunk_waveform.begin(),
+                                     chunk_waveform.end() - static_cast<std::ptrdiff_t>(keep));
+            }
+            request.chunk_callback(chunk_waveform);
+            pending_stream_frames = 0;
+            ++emitted_stream_chunks;
+        };
+
         for (int step = 0; step < max_len; ++step) {
             fill_noise(noise, patch_size_value, feat_dim_value, rng);
             VoxCPMDecodeOptions decode_options;
@@ -1092,23 +1132,15 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                 int recent_frame_count = 0;
 
                 if (use_output_pool_timeline && state.audio_frame_count > 0) {
-                    recent_frame_count = std::min(request.streaming_prefix_len, state.audio_frame_count);
-                    const int frame_offset = state.audio_frame_count - recent_frame_count;
-                    if (recent_frame_count > 0) {
-                        std::vector<float> chunk_waveform =
-                            decode_audio_from_output_pool(audio_vae_,
-                                                          audio_vae_backend(),
-                                                          *state.output_pool,
-                                                          frame_offset,
-                                                          recent_frame_count,
-                                                          patch_size_value,
-                                                          feat_dim_value);
-                        if (chunk_waveform.size() > static_cast<size_t>(decode_patch_len)) {
-                            chunk_waveform.erase(chunk_waveform.begin(),
-                                                 chunk_waveform.end() - static_cast<std::ptrdiff_t>(decode_patch_len));
-                        }
-                        clear_decode_graph_caches_after_streaming_audio_decode(runtime_, state);
-                        request.chunk_callback(chunk_waveform);
+                    // The windowed chunk decode costs a near-constant ~60 ms per call on
+                    // Metal (a ~650-node graph on tiny tensors is dispatch-bound, so the
+                    // window size barely matters). Emitting every step doubled the loop's
+                    // cost; instead the first two chunks go out per-step for fast first
+                    // audio and the rest are batched every VOXCPM_STREAM_CADENCE steps.
+                    ++pending_stream_frames;
+                    const int cadence = emitted_stream_chunks < 2 ? 1 : stream_cadence;
+                    if (pending_stream_frames >= cadence) {
+                        emit_pool_stream_chunk();
                     }
                 } else {
                     append_stream_frame(stream_recent_frames,
@@ -1127,7 +1159,10 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                             chunk_waveform.erase(chunk_waveform.begin(),
                                                  chunk_waveform.end() - static_cast<std::ptrdiff_t>(decode_patch_len));
                         }
-                        clear_decode_graph_caches_after_streaming_audio_decode(runtime_, state);
+                        // AudioVAE graphs allocate from their own compute arena
+                        // (VoxCPMBackend::stage_allocator), so the chunk decode can no
+                        // longer resize the arena the cached LM step graphs point into
+                        // and the caches stay valid across chunks.
                         request.chunk_callback(chunk_waveform);
                     }
                 }
@@ -1136,6 +1171,9 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
             if (step > kMinLen && result.output_2) {
                 break;
             }
+        }
+        if (request.chunk_callback && use_output_pool_timeline) {
+            emit_pool_stream_chunk();
         }
         const int generated_frames = use_output_pool_timeline
                                          ? std::max(0, state.audio_frame_count - prompt_audio_length)
@@ -1170,6 +1208,15 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
 
         std::vector<float> waveform;
         std::vector<float> latent;
+        if (request.skip_final_waveform && request.chunk_callback) {
+            // Streaming consumers already received every frame through
+            // chunk_callback; the whole-utterance decode would only recompute
+            // audio nobody reads.
+            SynthesisResult result;
+            result.sample_rate = audio_vae_.config().output_sample_rate();
+            result.generated_frames = generated_frames;
+            return result;
+        }
         const bool use_stateful_final_audio_decode =
             should_use_stateful_audio_decode(audio_vae_backend(), audio_vae_, total_patches);
         const int decode_stateful_chunk_frames =
