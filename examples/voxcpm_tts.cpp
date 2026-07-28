@@ -1249,18 +1249,17 @@ int main(int argc, char** argv) {
         }
         std::cerr << ")\n";
 
-        // The ggml Metal conv_transpose_1d path wedged the AGX GPU (oplog
-        // incident 2026-07-28). Until the rewritten kernel is validated
-        // on-device, AudioVAE graphs run on CPU when the main backend is
-        // Metal; the VAE weights stay in the Metal shared buffer, which is
-        // host-addressable on Apple Silicon, so nothing is loaded twice.
-        // Set VOXCPM_VAE_ON_METAL=1 to lift the quarantine for on-device
-        // validation in a maintenance window.
+        // AudioVAE runs on the main backend by default. VOXCPM_VAE_ON_CPU=1
+        // routes its graphs to a dedicated CPU backend instead — the escape
+        // hatch for the 2026-07-28 AGX incident class (pathological Metal
+        // kernels); the rewritten conv_transpose_1d has since passed
+        // on-device validation. The VAE weights stay in the main backend's
+        // shared buffer, which is host-addressable on Apple Silicon, so
+        // nothing is loaded twice.
         std::unique_ptr<VoxCPMBackend> vae_backend_holder;
-        if (backend.type() == BackendType::Metal && !env_flag_enabled("VOXCPM_VAE_ON_METAL")) {
+        if (backend.type() == BackendType::Metal && env_flag_enabled("VOXCPM_VAE_ON_CPU")) {
             vae_backend_holder = std::make_unique<VoxCPMBackend>(BackendType::CPU, options.threads);
-            std::cerr << "AudioVAE backend: cpu (Metal quarantined for AudioVAE; "
-                         "set VOXCPM_VAE_ON_METAL=1 to override)\n";
+            std::cerr << "AudioVAE backend: cpu (VOXCPM_VAE_ON_CPU=1)\n";
         }
         VoxCPMBackend& vae_backend = vae_backend_holder ? *vae_backend_holder : backend;
         std::cerr << "Loading GGUF from " << options.model_path << " with " << options.threads
