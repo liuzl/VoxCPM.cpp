@@ -6,12 +6,15 @@
 
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <filesystem>
 #include <iostream>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace voxcpm {
 namespace {
@@ -41,6 +44,7 @@ struct RequestContext {
     AudioResponseFormat format = AudioResponseFormat::Mp3;
     double speed = 1.0;
     bool sse = false;
+    bool stream = false;
     int max_attempts;
 };
 
@@ -230,9 +234,16 @@ RequestContext parse_request(const json& body, const Options& options) {
         fail("`stream_format` must be `audio` or `sse`");
     }
 
+    // OpenAI-style boolean: stream chunks while synthesis is still running.
+    // Delivered as raw float32 PCM ("audio/pcm" + X-Sample-Rate), which is the
+    // contract voxstudio's TtsClient.speechStream expects; `response_format`
+    // is ignored on this path.
+    ctx.stream = body.value("stream", false);
+
     if (body.contains("max-attempts")) {
         ctx.max_attempts = body.value("max-attempts", options.max_attempts);
         if (ctx.sse && ctx.max_attempts != 1) fail("`sse` mode does not support multiple attempts");
+        if (ctx.stream && ctx.max_attempts != 1) fail("`stream` mode does not support multiple attempts");
         if (ctx.max_attempts < 1) fail("`max-attempts` must not be less than 1");
     } else {
         // Default to 1, so stream_format="sse" is supported without specifying max_attempts.
@@ -452,7 +463,7 @@ int main(int argc, char** argv) {
                     return;
                 }
 
-                const auto permit = queue.acquire();
+                auto permit = queue.acquire();
                 if (!permit.has_value()) {
                     respond_error(res, 503, "Synthesis queue is full.", "server_error", "queue_full");
                     return;
@@ -463,6 +474,78 @@ int main(int argc, char** argv) {
                     prompt = voice_store.load_voice(ctx.voice_id);
                 } catch (const std::exception&) {
                     respond_error(res, 400, "Unknown voice id.", "invalid_request_error", "voice_not_found");
+                    return;
+                }
+
+                if (ctx.stream && !ctx.sse) {
+                    // True streaming: synthesis runs on a worker thread and pushes
+                    // per-step PCM chunks through a queue that the chunked content
+                    // provider drains, so the first audio leaves the server after
+                    // prefill + one decode window instead of after the whole
+                    // utterance.
+                    struct PcmStreamState {
+                        std::mutex mutex;
+                        std::condition_variable cv;
+                        std::deque<std::vector<uint8_t>> chunks;
+                        bool done = false;
+                        bool failed = false;
+                    };
+                    auto state = std::make_shared<PcmStreamState>();
+
+                    SynthesisRequest request;
+                    request.text = ctx.input;
+                    request.prompt = std::move(prompt);
+                    request.max_decode_steps = options.max_decode_steps;
+                    request.inference_timesteps = options.inference_timesteps;
+                    const int source_sample_rate = core.sample_rate();
+                    const double speed = ctx.speed;
+                    request.chunk_callback = [state, source_sample_rate, response_sample_rate, speed](
+                                                 const std::vector<float>& chunk_waveform) {
+                        const std::vector<float> prepared = prepare_response_waveform(chunk_waveform,
+                                                                                      source_sample_rate,
+                                                                                      response_sample_rate,
+                                                                                      speed);
+                        std::vector<uint8_t> bytes(prepared.size() * sizeof(float));
+                        std::memcpy(bytes.data(), prepared.data(), bytes.size());
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->chunks.push_back(std::move(bytes));
+                        state->cv.notify_one();
+                    };
+
+                    std::thread([state, request = std::move(request), permit = std::move(*permit), &core]() mutable {
+                        try {
+                            core.synthesize(request);
+                        } catch (const std::exception& e) {
+                            std::cerr << "[stream] synthesis failed: " << e.what() << "\n";
+                            std::lock_guard<std::mutex> lock(state->mutex);
+                            state->failed = true;
+                        }
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->done = true;
+                        state->cv.notify_one();
+                    }).detach();
+
+                    res.set_header("X-Sample-Rate", std::to_string(response_sample_rate));
+                    res.set_chunked_content_provider(
+                        "audio/pcm",
+                        [state](size_t, httplib::DataSink& sink) {
+                            std::vector<uint8_t> chunk;
+                            {
+                                std::unique_lock<std::mutex> lock(state->mutex);
+                                state->cv.wait(lock, [&]() { return state->done || !state->chunks.empty(); });
+                                if (state->chunks.empty()) {
+                                    if (state->failed) {
+                                        return false;
+                                    }
+                                    sink.done();
+                                    return true;
+                                }
+                                chunk = std::move(state->chunks.front());
+                                state->chunks.pop_front();
+                            }
+                            sink.write(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+                            return true;
+                        });
                     return;
                 }
 
