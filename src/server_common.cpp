@@ -1103,6 +1103,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
         int pending_stream_frames = 0;
         int emitted_stream_chunks = 0;
         const int stream_cadence = std::max(1, env_int_or_default("VOXCPM_STREAM_CADENCE", 4));
+        const int stream_first_emit_frames = std::max(1, env_int_or_default("VOXCPM_STREAM_FIRST_EMIT_FRAMES", 1));
 
         // Async chunk pipeline: the decode loop only enqueues (frame_offset,
         // recent, pending) descriptors; a single worker thread decodes each
@@ -1265,11 +1266,13 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                 if (use_output_pool_timeline && state.audio_frame_count > 0) {
                     // The windowed chunk decode costs a near-constant ~60 ms per call on
                     // Metal (a ~650-node graph on tiny tensors is dispatch-bound, so the
-                    // window size barely matters). Emitting every step doubled the loop's
-                    // cost; instead the first two chunks go out per-step for fast first
-                    // audio and the rest are batched every VOXCPM_STREAM_CADENCE steps.
+                    // window size barely matters), so emission is batched. The first
+                    // emission waits for VOXCPM_STREAM_FIRST_EMIT_FRAMES (default 1:
+                    // fastest first audio); raising it trades speech onset for a large
+                    // opening buffer that rides out contention at the start of a reply.
+                    // Later chunks go out every VOXCPM_STREAM_CADENCE steps.
                     ++pending_stream_frames;
-                    const int cadence = emitted_stream_chunks < 2 ? 1 : stream_cadence;
+                    const int cadence = emitted_stream_chunks == 0 ? stream_first_emit_frames : stream_cadence;
                     if (pending_stream_frames >= cadence) {
                         emit_pool_stream_chunk();
                     }
