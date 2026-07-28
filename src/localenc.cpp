@@ -149,7 +149,7 @@ ggml_tensor* LocEncModel::forward_sequence(VoxCPMContext& ctx, ggml_tensor* inpu
     }
 
     sync = ggml_scale(raw, sync, 0.0f);
-    return ggml_add1(raw, output, sync);
+    return ggml_add(raw, output, sync);
 }
 
 }  // namespace voxcpm

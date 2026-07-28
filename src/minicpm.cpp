@@ -643,7 +643,7 @@ ggml_tensor* MiniCPMModel::create_causal_mask(ggml_context* ctx,
     ggml_tensor* query_grid = ggml_repeat(ctx, query_positions, target);
 
     ggml_tensor* mask = ggml_sub(ctx, key_grid, query_grid);
-    mask = ggml_add1(ctx, mask, ggml_arange(ctx, -0.5f, 0.5f, 1.0f));
+    mask = ggml_scale_bias(ctx, mask, 1.0f, -0.5f);
     mask = ggml_step(ctx, mask);
     mask = ggml_scale(ctx, mask, kCausalMaskNeg);
     return ggml_cont(ctx, ggml_cast(ctx, mask, GGML_TYPE_F16));
@@ -739,7 +739,7 @@ ggml_tensor* MiniCPMModel::attention_forward(ggml_context* ctx,
                                             1.0f / std::sqrt(static_cast<float>(head_dim)),
                                             0.0f, 0.0f);
     if (kv_sync) {
-        attn = ggml_add1(ctx, attn, kv_sync);
+        attn = ggml_add(ctx, attn, kv_sync);
     }
     attn = ggml_reshape_2d(ctx, attn, config_.n_heads * head_dim, n_tokens);
     return ggml_mul_mat(ctx, lw.o_proj, attn);

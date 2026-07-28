@@ -289,9 +289,7 @@ ggml_tensor* LocDiTModel::build_cfg_pair_attention_mask(VoxCPMContext& ctx, int 
     const float branch_boundary = 0.5f - static_cast<float>(branch_len);
 
     ggml_tensor* token_ids = ggml_arange(raw, 0.0f, static_cast<float>(total_len), 1.0f);
-    ggml_tensor* branch_ids = ggml_add1(raw,
-                                        token_ids,
-                                        ggml_arange(raw, branch_boundary, branch_boundary + 1.0f, 1.0f));
+    ggml_tensor* branch_ids = ggml_scale_bias(raw, token_ids, 1.0f, branch_boundary);
     branch_ids = ggml_step(raw, branch_ids);
 
     ggml_tensor* key_ids = ggml_reshape_2d(raw, branch_ids, total_len, 1);
@@ -557,7 +555,7 @@ ggml_tensor* LocDiTModel::forward(VoxCPMContext& ctx,
     }
 
     sync = ggml_scale(raw, sync, 0.0f);
-    return ggml_add1(raw, output, sync);
+    return ggml_add(raw, output, sync);
 }
 
 void LocDiTModel::forward_cfg_pair(VoxCPMContext& ctx,

@@ -144,6 +144,23 @@ static void depthwise_conv_custom(ggml_tensor* dst,
 }
 
 
+static ggml_tensor* left_pad_1d(ggml_context* ctx, ggml_tensor* x, int64_t frames) {
+    if (frames <= 0) {
+        return x;
+    }
+
+    // The zero block must not be derived from the input values: 0 * x would
+    // turn a NaN/Inf input element into NaN padding. ggml_arange is input-
+    // independent, so scaling it by zero yields literal zeros.
+    ggml_tensor* zero_line = ggml_scale(ctx, ggml_arange(ctx, 0.0f, static_cast<float>(frames), 1.0f), 0.0f);
+    if (x->type != GGML_TYPE_F32) {
+        zero_line = ggml_cast(ctx, zero_line, x->type);
+    }
+    ggml_tensor* shape = ggml_new_tensor_3d(ctx, x->type, frames, x->ne[1], x->ne[2]);
+    ggml_tensor* zeros = ggml_repeat(ctx, ggml_reshape_3d(ctx, zero_line, frames, 1, 1), shape);
+    return ggml_concat(ctx, zeros, x, 0);
+}
+
 static ggml_tensor* conv1d_mul_mat_impl(ggml_context* ctx,
                                         ggml_tensor* weight,
                                         ggml_tensor* input,
@@ -236,7 +253,7 @@ ggml_tensor* snake_activation(ggml_context* ctx, ggml_tensor* x, ggml_tensor* al
     const int64_t channels = alpha->ne[1] > 1 ? alpha->ne[1] : alpha->ne[0];
     ggml_tensor* alpha_view = ggml_reshape_3d(ctx, alpha, 1, channels, 1);
     ggml_tensor* alpha_broadcast = ggml_repeat(ctx, alpha_view, x);
-    ggml_tensor* alpha_eps = ggml_add1(ctx, alpha_broadcast, ggml_arange(ctx, eps, eps + 1.0f, 1.0f));
+    ggml_tensor* alpha_eps = ggml_scale_bias(ctx, alpha_broadcast, 1.0f, eps);
     ggml_tensor* ax = ggml_mul(ctx, x, alpha_broadcast);
     ggml_tensor* sin_sq = ggml_sqr(ctx, ggml_sin(ctx, ax));
     ggml_tensor* one = ggml_arange(ctx, 1.0f, 2.0f, 1.0f);
@@ -599,7 +616,7 @@ ggml_tensor* AudioVAE::causal_conv1d(ggml_context* ctx,
                                      int padding) const {
     ggml_tensor* padded = x;
     if (padding > 0) {
-        padded = ggml_pad_ext(ctx, x, padding * 2, 0, 0, 0, 0, 0, 0, 0);
+        padded = left_pad_1d(ctx, x, padding * 2);
     }
     ggml_tensor* result = conv1d_mul_mat_impl(ctx, weight, padded, kernel_size, stride, dilation);
     if (bias) {
@@ -653,7 +670,7 @@ ggml_tensor* AudioVAE::causal_conv1d_dw(ggml_context* ctx,
         // Replace unsupported ggml_map_custom3 call with standard depthwise convolution.
 
         ggml_tensor* padded = x;
-        if (padding > 0) padded = ggml_pad_ext(ctx, x, padding * 2, 0, 0, 0, 0, 0, 0, 0);
+        if (padding > 0) padded = left_pad_1d(ctx, x, padding * 2);
         padded = ggml_cont(ctx, padded);
 
         ggml_tensor* result;
@@ -663,10 +680,10 @@ ggml_tensor* AudioVAE::causal_conv1d_dw(ggml_context* ctx,
         return ggml_cont(ctx, result);
     }
 
-    if (backend.type() == BackendType::CUDA) {
+    if (backend.type() == BackendType::CUDA || backend.type() == BackendType::Metal) {
         ggml_tensor* padded = x;
         if (padding > 0) {
-            padded = ggml_pad_ext(ctx, x, padding * 2, 0, 0, 0, 0, 0, 0, 0);
+            padded = left_pad_1d(ctx, x, padding * 2);
         }
 
         ggml_tensor* result = ggml_conv_1d_dw(ctx, weight, padded, stride, 0, dilation);

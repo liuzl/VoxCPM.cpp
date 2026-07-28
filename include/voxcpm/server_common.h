@@ -105,6 +105,10 @@ private:
                                                 int sample_rate);
     SynthesisResult synthesize_locked(const SynthesisRequest& request);
 
+    // Backend used for AudioVAE encode/decode graphs. Falls back to the
+    // dedicated CPU backend when the main backend is Metal (see load()).
+    VoxCPMBackend& audio_vae_backend() { return vae_backend_ ? *vae_backend_ : *backend_; }
+
     std::string model_path_;
     BackendType backend_type_;
     int threads_ = 4;
@@ -112,6 +116,7 @@ private:
 
     std::shared_ptr<VoxCPMWeightStore> store_;
     std::unique_ptr<VoxCPMBackend> backend_;
+    std::unique_ptr<VoxCPMBackend> vae_backend_;
     VoxCPMRuntime runtime_;
     AudioVAE audio_vae_;
     std::unique_ptr<VoxCPMTokenizer> tokenizer_;

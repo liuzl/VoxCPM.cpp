@@ -82,8 +82,17 @@ ggml_tensor* fsq_quantize(ggml_context* ctx, ggml_tensor* x, int scale) {
     VOXCPM_ASSERT(x != nullptr);
     VOXCPM_ASSERT(scale > 0);
 
+    // Round to nearest via the fp32 magic constant: exact for |v| < 2^22, and the
+    // FSQ operand is tanh(.)*scale so it stays in single digits. GGML_UNARY_OP_ROUND
+    // only exists on CPU/CUDA; SCALE (with bias) is available on every backend.
+    // Ties round to even (IEEE default), matching torch.round in the upstream
+    // model; ggml_round (roundf) would round ties away from zero instead. Exact
+    // .5 ties are measure-zero for tanh outputs, and using one path everywhere
+    // keeps all backends bit-identical.
+    constexpr float kRoundMagic = 12582912.0f;  // 1.5 * 2^23
     ggml_tensor* scaled = ggml_scale(ctx, x, static_cast<float>(scale));
-    ggml_tensor* rounded = ggml_round(ctx, scaled);
+    ggml_tensor* rounded = ggml_scale_bias(ctx, scaled, 1.0f, kRoundMagic);
+    rounded = ggml_scale_bias(ctx, rounded, 1.0f, -kRoundMagic);
     return ggml_scale(ctx, rounded, 1.0f / static_cast<float>(scale));
 }
 
