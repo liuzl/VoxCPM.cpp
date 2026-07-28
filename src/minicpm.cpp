@@ -430,6 +430,12 @@ bool MiniCPMModel::init_fused_projection_tensors(VoxCPMBackend& backend, const s
         return true;
     }
 
+    // Fusing q/k/v and gate/up only pays off for LocDiT: its unrolled CFM
+    // graph is a long serial dependency chain where launch count matters.
+    // For BaseLM/ResidualLM single-token steps the Metal encoder already
+    // overlaps the independent projections (measured 2026-07-28: extending
+    // fusion to all instances changed step timings by ~0 while duplicating
+    // ~1 GB of weights), so the wider gate is not worth the memory.
     if (prefix != "locdit." || !backend.is_gpu()) {
         return true;
     }

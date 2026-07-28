@@ -13,8 +13,11 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <thread>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -840,6 +843,22 @@ void VoxCPMServiceCore::load() {
         std::cerr << "AudioVAE backend: cpu (VOXCPM_VAE_ON_CPU=1)\n";
     }
 
+    // Streaming chunk decodes run on a worker thread with their own backend
+    // instance (own command queue), overlapping the ~60 ms windowed AudioVAE
+    // decode with the next LM step instead of serializing it into the decode
+    // loop. VOXCPM_ASYNC_CHUNK_DECODE=0 disables the worker.
+    const char* async_chunk = std::getenv("VOXCPM_ASYNC_CHUNK_DECODE");
+    const bool async_chunk_enabled = !(async_chunk && *async_chunk && std::strcmp(async_chunk, "0") == 0);
+    if (backend_->is_gpu() && !vae_backend_ && async_chunk_enabled) {
+        // CPU, not a second GPU queue: on a single GPU another queue does not
+        // reduce total GPU work, while the CPU sits idle during the decode
+        // loop and chunk jobs arrive only every few steps. Unified memory
+        // means the CPU worker reads the pool and the f16 VAE weights from
+        // the Metal shared buffers with no copies.
+        stream_chunk_backend_ = std::make_unique<VoxCPMBackend>(BackendType::CPU, threads_);
+        std::cerr << "Streaming chunk decode: async on cpu\n";
+    }
+
     store_ = std::make_shared<VoxCPMWeightStore>();
     if (!store_->load_from_file(model_path_, *backend_)) {
         fail("Failed to load GGUF: " + model_path_);
@@ -1084,6 +1103,100 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
         int pending_stream_frames = 0;
         int emitted_stream_chunks = 0;
         const int stream_cadence = std::max(1, env_int_or_default("VOXCPM_STREAM_CADENCE", 4));
+
+        // Async chunk pipeline: the decode loop only enqueues (frame_offset,
+        // recent, pending) descriptors; a single worker thread decodes each
+        // window on its own backend queue and invokes chunk_callback in FIFO
+        // order. Enqueueing happens after the synchronous LM graph compute, so
+        // every frame in the window is fully written before the worker reads
+        // it. Falls back to inline decoding without the dedicated backend.
+        struct StreamChunkJob {
+            int frame_offset;
+            int recent;
+            int pending;
+        };
+        std::deque<StreamChunkJob> chunk_jobs;
+        std::mutex chunk_mutex;
+        std::condition_variable chunk_cv;
+        bool chunk_jobs_done = false;
+        std::exception_ptr chunk_worker_error;
+        std::thread chunk_worker;
+        const bool async_chunks = stream_chunk_backend_ != nullptr &&
+                                  request.chunk_callback != nullptr &&
+                                  state.output_pool != nullptr;
+        // The pool object outlives the loop, but ownership of it is moved out
+        // of `state` for the duration of every runtime_.decode call — the
+        // worker must hold the pointee directly, never read state.output_pool.
+        VoxCPMOutputPool* const stream_pool = async_chunks ? state.output_pool.get() : nullptr;
+        if (async_chunks) {
+            chunk_worker = std::thread([&]() {
+                for (;;) {
+                    StreamChunkJob job;
+                    {
+                        std::unique_lock<std::mutex> lock(chunk_mutex);
+                        chunk_cv.wait(lock, [&]() { return chunk_jobs_done || !chunk_jobs.empty(); });
+                        if (chunk_jobs.empty()) {
+                            return;
+                        }
+                        job = chunk_jobs.front();
+                        chunk_jobs.pop_front();
+                    }
+                    try {
+                        std::vector<float> chunk_waveform = decode_audio_from_output_pool(audio_vae_,
+                                                                                          *stream_chunk_backend_,
+                                                                                          *stream_pool,
+                                                                                          job.frame_offset,
+                                                                                          job.recent,
+                                                                                          patch_size_value,
+                                                                                          feat_dim_value);
+                        const size_t keep =
+                            static_cast<size_t>(decode_patch_len) * static_cast<size_t>(job.pending);
+                        if (chunk_waveform.size() > keep) {
+                            chunk_waveform.erase(chunk_waveform.begin(),
+                                                 chunk_waveform.end() - static_cast<std::ptrdiff_t>(keep));
+                        }
+                        request.chunk_callback(chunk_waveform);
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lock(chunk_mutex);
+                        chunk_worker_error = std::current_exception();
+                        return;
+                    }
+                }
+            });
+        }
+        struct ChunkWorkerGuard {
+            std::thread& worker;
+            std::mutex& mutex;
+            std::condition_variable& cv;
+            bool& done;
+            ~ChunkWorkerGuard() {
+                if (!worker.joinable()) {
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    done = true;
+                }
+                cv.notify_one();
+                worker.join();
+            }
+        } chunk_worker_guard{chunk_worker, chunk_mutex, chunk_cv, chunk_jobs_done};
+
+        const auto finish_chunk_worker = [&]() {
+            if (!chunk_worker.joinable()) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(chunk_mutex);
+                chunk_jobs_done = true;
+            }
+            chunk_cv.notify_one();
+            chunk_worker.join();
+            if (chunk_worker_error) {
+                std::rethrow_exception(chunk_worker_error);
+            }
+        };
+
         const auto emit_pool_stream_chunk = [&]() {
             if (pending_stream_frames <= 0) {
                 return;
@@ -1092,6 +1205,24 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                                         state.audio_frame_count);
             const int frame_offset = state.audio_frame_count - recent;
             if (recent <= 0) {
+                return;
+            }
+            // The very first chunk decodes inline on the main (GPU) backend:
+            // ~60 ms there versus ~150+ ms on the CPU worker directly delays
+            // first audio. Later chunks go to the worker, whose latency hides
+            // behind playback. The inline decode finishes before any job is
+            // enqueued, so callback ordering stays FIFO.
+            if (async_chunks && emitted_stream_chunks > 0) {
+                {
+                    std::lock_guard<std::mutex> lock(chunk_mutex);
+                    if (chunk_worker_error) {
+                        std::rethrow_exception(chunk_worker_error);
+                    }
+                    chunk_jobs.push_back(StreamChunkJob{frame_offset, recent, pending_stream_frames});
+                }
+                chunk_cv.notify_one();
+                pending_stream_frames = 0;
+                ++emitted_stream_chunks;
                 return;
             }
             std::vector<float> chunk_waveform = decode_audio_from_output_pool(audio_vae_,
@@ -1175,6 +1306,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
         if (request.chunk_callback && use_output_pool_timeline) {
             emit_pool_stream_chunk();
         }
+        finish_chunk_worker();
         const int generated_frames = use_output_pool_timeline
                                          ? std::max(0, state.audio_frame_count - prompt_audio_length)
                                          : static_cast<int>(generated_steps.size() / frame_stride);

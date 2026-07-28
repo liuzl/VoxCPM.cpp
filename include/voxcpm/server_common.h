@@ -118,6 +118,11 @@ private:
     // dedicated CPU backend when the main backend is Metal (see load()).
     VoxCPMBackend& audio_vae_backend() { return vae_backend_ ? *vae_backend_ : *backend_; }
 
+    // Second GPU backend instance (own command queue) that a worker thread
+    // uses to decode streaming chunks concurrently with the LM decode loop.
+    // Null when the main backend is CPU or the VAE is quarantined to CPU.
+    std::unique_ptr<VoxCPMBackend> stream_chunk_backend_;
+
     std::string model_path_;
     BackendType backend_type_;
     int threads_ = 4;
