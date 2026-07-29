@@ -210,18 +210,20 @@ RequestContext parse_request(const json& body, const Options& options) {
         }
     }
 
-    if (!body.contains("voice")) {
-        fail("`voice` is required");
-    }
-    if (body["voice"].is_string()) {
-        ctx.voice_id = body["voice"].get<std::string>();
-    } else if (body["voice"].is_object() && body["voice"].contains("id") && body["voice"]["id"].is_string()) {
-        ctx.voice_id = body["voice"]["id"].get<std::string>();
-    } else {
-        fail("`voice` must be a string or an object with an `id` field");
-    }
-    if (!is_valid_voice_id(ctx.voice_id)) {
-        fail("`voice` must be a valid voice id");
+    // `voice` is optional: when absent (or null/empty), synthesis runs without
+    // reference conditioning ("design mode"), where a leading parenthesized
+    // style description in `input` — e.g. "(温柔的男声)你好" — steers the voice.
+    if (body.contains("voice") && !body["voice"].is_null()) {
+        if (body["voice"].is_string()) {
+            ctx.voice_id = body["voice"].get<std::string>();
+        } else if (body["voice"].is_object() && body["voice"].contains("id") && body["voice"]["id"].is_string()) {
+            ctx.voice_id = body["voice"]["id"].get<std::string>();
+        } else {
+            fail("`voice` must be a string or an object with an `id` field");
+        }
+        if (!ctx.voice_id.empty() && !is_valid_voice_id(ctx.voice_id)) {
+            fail("`voice` must be a valid voice id");
+        }
     }
 
     const std::string response_format = body.value("response_format", std::string("mp3"));
@@ -270,7 +272,9 @@ RequestContext parse_request(const json& body, const Options& options) {
     // session on the voice anchor alone (merging prior chunks caused tempo
     // drift), which for registered voices is exactly what independent
     // requests with the same voice already do. Sessions only matter for
-    // reference-less (design) voices, which this server does not offer yet.
+    // reference-less (design) voices, where each request re-rolls the voice;
+    // pinning a designed voice across chunks would need feature capture at
+    // synthesis time, which is not implemented yet.
     if (body.contains("continuation_id") && !body["continuation_id"].is_null()) {
         if (!body["continuation_id"].is_string()) {
             fail("`continuation_id` must be a string");
@@ -565,11 +569,21 @@ int main(int argc, char** argv) {
                 }
 
                 PromptFeatures prompt;
-                try {
-                    prompt = voice_store.load_voice(ctx.voice_id);
-                } catch (const std::exception&) {
-                    respond_error(res, 400, "Unknown voice id.", "invalid_request_error", "voice_not_found");
-                    return;
+                if (ctx.voice_id.empty()) {
+                    // Design mode: an empty prompt (no reference features) is a
+                    // valid conditioning state for the engine; the style comes
+                    // from the parenthesized prefix in the input text.
+                    prompt.id = "__design__";
+                    prompt.sample_rate = core.sample_rate();
+                    prompt.patch_size = core.patch_size();
+                    prompt.feat_dim = core.feat_dim();
+                } else {
+                    try {
+                        prompt = voice_store.load_voice(ctx.voice_id);
+                    } catch (const std::exception&) {
+                        respond_error(res, 400, "Unknown voice id.", "invalid_request_error", "voice_not_found");
+                        return;
+                    }
                 }
 
                 if (ctx.stream && !ctx.sse) {
