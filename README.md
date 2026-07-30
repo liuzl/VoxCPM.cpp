@@ -133,6 +133,7 @@ If you are unsure, check your GPU model first instead of copying `89` blindly.
 `voxcpm-server` now exposes a single-port HTTP API for:
 
 - `POST /v1/voices`
+- `POST /v1/design-profiles`
 - `GET /v1/voices/{id}`
 - `DELETE /v1/voices/{id}`
 - `POST /v1/audio/speech`

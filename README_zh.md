@@ -131,6 +131,7 @@ cmake --build build-cuda
 `voxcpm-server` 现在提供单端口 HTTP 服务，同时支持：
 
 - `POST /v1/voices`
+- `POST /v1/design-profiles`
 - `GET /v1/voices/{id}`
 - `DELETE /v1/voices/{id}`
 - `POST /v1/audio/speech`

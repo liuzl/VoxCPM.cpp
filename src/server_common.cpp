@@ -719,6 +719,16 @@ void VoiceStore::save_voice(const PromptFeatures& features) {
         {"created_at", features.created_at},
         {"updated_at", features.updated_at},
     };
+    if (features.design_profile) {
+        manifest["design_profile"] = {
+            {"description", features.design_profile->description},
+            {"seed", features.design_profile->seed},
+            {"cfg_value", features.design_profile->cfg_value},
+            {"timesteps", features.design_profile->timesteps},
+            {"model", features.design_profile->model},
+            {"model_manifest_sha256", nullptr},
+        };
+    }
 
     std::ofstream out(manifest_path_for(root_dir_, features.id));
     if (!out.is_open()) {
@@ -756,6 +766,15 @@ PromptFeatures VoiceStore::load_voice(const std::string& id) const {
     features.feat_dim = manifest.at("feat_dim").get<int>();
     features.created_at = manifest.value("created_at", "");
     features.updated_at = manifest.value("updated_at", "");
+    if (manifest.contains("design_profile") && manifest["design_profile"].is_object()) {
+        const json& profile = manifest["design_profile"];
+        features.design_profile.emplace();
+        features.design_profile->description = profile.at("description").get<std::string>();
+        features.design_profile->seed = profile.at("seed").get<int64_t>();
+        features.design_profile->cfg_value = profile.at("cfg_value").get<float>();
+        features.design_profile->timesteps = profile.at("timesteps").get<int>();
+        features.design_profile->model = profile.at("model").get<std::string>();
+    }
     features.prompt_feat = read_binary_file(prompt_path);
     if (features.reference_audio_length > 0) {
         const auto ref_path = reference_path_for(root_dir_, id);
@@ -769,17 +788,20 @@ PromptFeatures VoiceStore::load_voice(const std::string& id) const {
 
 VoiceMetadata VoiceStore::load_metadata(const std::string& id) const {
     const PromptFeatures features = load_voice(id);
-    return VoiceMetadata{
-        features.id,
-        features.prompt_text,
-        features.prompt_audio_length,
-        features.reference_audio_length,
-        features.sample_rate,
-        features.patch_size,
-        features.feat_dim,
-        features.created_at,
-        features.updated_at,
-    };
+    VoiceMetadata metadata;
+    metadata.id = features.id;
+    metadata.prompt_text = features.prompt_text;
+    metadata.prompt_audio_length = features.prompt_audio_length;
+    metadata.reference_audio_length = features.reference_audio_length;
+    metadata.sample_rate = features.sample_rate;
+    metadata.patch_size = features.patch_size;
+    metadata.feat_dim = features.feat_dim;
+    metadata.created_at = features.created_at;
+    metadata.updated_at = features.updated_at;
+    if (features.design_profile) {
+        metadata.design_profile = *features.design_profile;
+    }
+    return metadata;
 }
 
 std::vector<VoiceMetadata> VoiceStore::list_voices() const {

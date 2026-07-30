@@ -161,7 +161,7 @@ void respond_error(httplib::Response& res,
 }
 
 json metadata_to_json(const VoiceMetadata& metadata) {
-    return {
+    json body = {
         {"id", metadata.id},
         {"prompt_text", metadata.prompt_text},
         {"prompt_audio_length", metadata.prompt_audio_length},
@@ -171,6 +171,17 @@ json metadata_to_json(const VoiceMetadata& metadata) {
         {"created_at", metadata.created_at},
         {"updated_at", metadata.updated_at},
     };
+    if (metadata.design_profile) {
+        body["design_profile"] = {
+            {"description", metadata.design_profile->description},
+            {"seed", metadata.design_profile->seed},
+            {"cfg_value", metadata.design_profile->cfg_value},
+            {"timesteps", metadata.design_profile->timesteps},
+            {"model", metadata.design_profile->model},
+            {"model_manifest_sha256", nullptr},
+        };
+    }
+    return body;
 }
 
 bool authorize(const Options& options, const httplib::Request& req, httplib::Response& res) {
@@ -223,6 +234,9 @@ RequestContext parse_request(const json& body, const Options& options) {
         }
         if (!ctx.voice_id.empty() && !is_valid_voice_id(ctx.voice_id)) {
             fail("`voice` must be a valid voice id");
+        }
+        if (ctx.voice_id == "design") {
+            ctx.voice_id.clear();
         }
     }
 
@@ -460,8 +474,98 @@ int main(int argc, char** argv) {
         httplib::Server server;
         server.new_task_queue = [] { return new httplib::ThreadPool(8); };
 
-        server.Get("/healthz", [](const httplib::Request&, httplib::Response& res) {
-            respond_json(res, 200, {{"status", "ok"}});
+        const auto health = [&](const httplib::Request&, httplib::Response& res) {
+            respond_json(res, 200, {
+                {"status", "ok"},
+                {"model", options.model_name},
+                {"model_manifest_sha256", nullptr},
+            });
+        };
+        server.Get("/healthz", health);
+        server.Get("/health", health);
+
+        server.Post("/v1/design-profiles", [&](const httplib::Request& req, httplib::Response& res) {
+            if (!authorize(options, req, res)) {
+                return;
+            }
+
+            std::string id;
+            bool saved = false;
+            try {
+                const json body = json::parse(req.body);
+                if (!body.contains("id") || !body["id"].is_string()) fail("`id` is required and must be a string");
+                if (!body.contains("description") || !body["description"].is_string()) {
+                    fail("`description` is required and must be a string");
+                }
+                if (!body.contains("anchor_text") || !body["anchor_text"].is_string()) {
+                    fail("`anchor_text` is required and must be a string");
+                }
+                if (!body.contains("seed") || !body["seed"].is_number_integer()) {
+                    fail("`seed` is required and must be an integer");
+                }
+                id = body["id"].get<std::string>();
+                const std::string description = body["description"].get<std::string>();
+                const std::string anchor_text = body["anchor_text"].get<std::string>();
+                const int64_t seed = body["seed"].get<int64_t>();
+                const float cfg_value = body.value("cfg_value", 2.0f);
+                const int timesteps = body.value("timesteps", options.inference_timesteps);
+                if (!is_valid_voice_id(id)) fail("Invalid voice id");
+                if (description.find_first_not_of(" \t\r\n") == std::string::npos ||
+                    anchor_text.find_first_not_of(" \t\r\n") == std::string::npos) {
+                    fail("`description` and `anchor_text` must not be empty");
+                }
+                if (description.size() + anchor_text.size() + 2 > 4096) {
+                    fail("combined `description` and `anchor_text` must not exceed 4096 bytes");
+                }
+                if (seed < 0) fail("`seed` must be a non-negative integer");
+                if (!(cfg_value > 0.0f && cfg_value <= 16.0f)) fail("`cfg_value` must be in (0, 16]");
+                if (timesteps < 1 || timesteps > 100) fail("`timesteps` must be between 1 and 100");
+                if (voice_store.has_voice(id)) {
+                    respond_error(res, 409, "Voice id already exists.", "invalid_request_error", "voice_exists");
+                    return;
+                }
+
+                auto permit = queue.acquire();
+                if (!permit.has_value()) {
+                    respond_error(res, 503, "Synthesis queue is full.", "server_error", "queue_full");
+                    return;
+                }
+                if (voice_store.has_voice(id)) {
+                    respond_error(res, 409, "Voice id already exists.", "invalid_request_error", "voice_exists");
+                    return;
+                }
+
+                PromptFeatures empty_prompt;
+                empty_prompt.id = "__design__";
+                empty_prompt.sample_rate = core.sample_rate();
+                empty_prompt.patch_size = core.patch_size();
+                empty_prompt.feat_dim = core.feat_dim();
+                SynthesisRequest design_request;
+                design_request.text = "(" + description + ")" + anchor_text;
+                design_request.prompt = std::move(empty_prompt);
+                design_request.cfg_value = cfg_value;
+                design_request.inference_timesteps = timesteps;
+                design_request.seed = seed;
+                design_request.max_decode_steps = options.max_decode_steps;
+                const SynthesisResult designed = core.synthesize(design_request);
+
+                PromptFeatures features = core.encode_prompt_audio(
+                    id, anchor_text, designed.waveform, designed.sample_rate);
+                features.design_profile.emplace();
+                features.design_profile->description = description;
+                features.design_profile->seed = seed;
+                features.design_profile->cfg_value = cfg_value;
+                features.design_profile->timesteps = timesteps;
+                features.design_profile->model = options.model_name;
+                voice_store.save_voice(features);
+                saved = true;
+                respond_json(res, 201, metadata_to_json(voice_store.load_metadata(id)));
+            } catch (const std::exception& e) {
+                if (saved) {
+                    voice_store.delete_voice(id);
+                }
+                respond_error(res, 400, e.what(), "invalid_request_error", "bad_request");
+            }
         });
 
         server.Post("/v1/voices", [&](const httplib::Request& req, httplib::Response& res) {

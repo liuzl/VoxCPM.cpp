@@ -10,10 +10,19 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace voxcpm {
+
+struct DesignProfileMetadata {
+    std::string description;
+    int64_t seed = 0;
+    float cfg_value = 2.0f;
+    int timesteps = 10;
+    std::string model;
+};
 
 struct PromptFeatures {
     std::string id;
@@ -27,6 +36,7 @@ struct PromptFeatures {
     int feat_dim = 0;
     std::string created_at;
     std::string updated_at;
+    std::optional<DesignProfileMetadata> design_profile;
 };
 
 struct VoiceMetadata {
@@ -39,6 +49,7 @@ struct VoiceMetadata {
     int feat_dim = 0;
     std::string created_at;
     std::string updated_at;
+    std::optional<DesignProfileMetadata> design_profile;
 };
 
 struct SynthesisRequest {

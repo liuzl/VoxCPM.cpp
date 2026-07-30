@@ -129,6 +129,12 @@ TEST_CASE("VoiceStore persists manifest and prompt features round-trip", "[serve
     features.feat_dim = 2;
     features.created_at = "2026-03-18T00:00:00Z";
     features.updated_at = "2026-03-18T00:00:01Z";
+    features.design_profile.emplace();
+    features.design_profile->description = "warm narrator";
+    features.design_profile->seed = 42;
+    features.design_profile->cfg_value = 2.5f;
+    features.design_profile->timesteps = 8;
+    features.design_profile->model = "voxcpm2";
 
     store.save_voice(features);
     REQUIRE(store.has_voice(features.id));
@@ -143,11 +149,19 @@ TEST_CASE("VoiceStore persists manifest and prompt features round-trip", "[serve
     REQUIRE(loaded.sample_rate == features.sample_rate);
     REQUIRE(loaded.patch_size == features.patch_size);
     REQUIRE(loaded.feat_dim == features.feat_dim);
+    REQUIRE(loaded.design_profile.has_value());
+    REQUIRE(loaded.design_profile->description == "warm narrator");
+    REQUIRE(loaded.design_profile->seed == 42);
+    REQUIRE(loaded.design_profile->cfg_value == 2.5f);
+    REQUIRE(loaded.design_profile->timesteps == 8);
+    REQUIRE(loaded.design_profile->model == "voxcpm2");
 
     const VoiceMetadata metadata = store.load_metadata(features.id);
     REQUIRE(metadata.id == features.id);
     REQUIRE(metadata.prompt_text == features.prompt_text);
     REQUIRE(metadata.reference_audio_length == features.reference_audio_length);
+    REQUIRE(metadata.design_profile.has_value());
+    REQUIRE(metadata.design_profile->description == "warm narrator");
 
     store.delete_voice(features.id);
     REQUIRE_FALSE(store.has_voice(features.id));
