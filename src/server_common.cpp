@@ -58,6 +58,10 @@ std::filesystem::path reference_path_for(const std::string& root, const std::str
     return std::filesystem::path(root) / id / "reference_feat.bin";
 }
 
+std::filesystem::path source_audio_path_for(const std::string& root, const std::string& id) {
+    return std::filesystem::path(root) / id / "ref.wav";
+}
+
 constexpr int32_t kAudioStartToken = 101;
 constexpr int32_t kRefAudioStartToken = 103;
 constexpr int32_t kRefAudioEndToken = 104;
@@ -113,6 +117,16 @@ void write_binary_file(const std::filesystem::path& path, const std::vector<floa
         fail("Failed to open file for writing: " + path.string());
     }
     out.write(reinterpret_cast<const char*>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
+}
+
+void write_binary_bytes(const std::filesystem::path& path, const std::vector<uint8_t>& values) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out.is_open()) {
+        fail("Failed to open file for writing: " + path.string());
+    }
+    if (!values.empty()) {
+        out.write(reinterpret_cast<const char*>(values.data()), static_cast<std::streamsize>(values.size()));
+    }
 }
 
 std::vector<float> read_binary_file(const std::filesystem::path& path) {
@@ -701,7 +715,9 @@ bool VoiceStore::has_voice(const std::string& id) const {
            std::filesystem::exists(prompt_path_for(root_dir_, id));
 }
 
-void VoiceStore::save_voice(const PromptFeatures& features) {
+void VoiceStore::save_voice(const PromptFeatures& features,
+                            const std::vector<uint8_t>& source_wav,
+                            int source_audio_sample_rate) {
     if (!is_valid_voice_id(features.id)) {
         fail("Invalid voice id");
     }
@@ -719,6 +735,17 @@ void VoiceStore::save_voice(const PromptFeatures& features) {
         {"created_at", features.created_at},
         {"updated_at", features.updated_at},
     };
+    if (!source_wav.empty()) {
+        if (source_audio_sample_rate <= 0) {
+            fail("Invalid source audio sample rate");
+        }
+        manifest["source_audio"] = {
+            {"file", "ref.wav"},
+            {"format", "wav"},
+            {"bytes", source_wav.size()},
+            {"sample_rate", source_audio_sample_rate},
+        };
+    }
     if (features.design_profile) {
         manifest["design_profile"] = {
             {"description", features.design_profile->description},
@@ -730,11 +757,6 @@ void VoiceStore::save_voice(const PromptFeatures& features) {
         };
     }
 
-    std::ofstream out(manifest_path_for(root_dir_, features.id));
-    if (!out.is_open()) {
-        fail("Failed to write voice manifest");
-    }
-    out << manifest.dump(2);
     write_binary_file(prompt_path_for(root_dir_, features.id), features.prompt_feat);
     if (!features.reference_feat.empty()) {
         write_binary_file(reference_path_for(root_dir_, features.id), features.reference_feat);
@@ -742,6 +764,17 @@ void VoiceStore::save_voice(const PromptFeatures& features) {
         std::error_code ec;
         std::filesystem::remove(reference_path_for(root_dir_, features.id), ec);
     }
+    if (!source_wav.empty()) {
+        write_binary_bytes(source_audio_path_for(root_dir_, features.id), source_wav);
+    }
+
+    // Publish the manifest last: has_voice() cannot expose an entry whose
+    // portable source or derived features were only partially written.
+    std::ofstream out(manifest_path_for(root_dir_, features.id));
+    if (!out.is_open()) {
+        fail("Failed to write voice manifest");
+    }
+    out << manifest.dump(2);
 }
 
 PromptFeatures VoiceStore::load_voice(const std::string& id) const {
@@ -766,6 +799,17 @@ PromptFeatures VoiceStore::load_voice(const std::string& id) const {
     features.feat_dim = manifest.at("feat_dim").get<int>();
     features.created_at = manifest.value("created_at", "");
     features.updated_at = manifest.value("updated_at", "");
+    if (manifest.contains("source_audio") && manifest["source_audio"].is_object()) {
+        const json& source = manifest["source_audio"];
+        const auto source_path = source_audio_path_for(root_dir_, id);
+        features.source_audio_bytes = source.value("bytes", static_cast<size_t>(0));
+        features.source_audio_sample_rate = source.value("sample_rate", 0);
+        std::error_code size_error;
+        const uintmax_t actual_bytes = std::filesystem::file_size(source_path, size_error);
+        features.source_audio_available = !size_error && features.source_audio_bytes > 0 &&
+                                          actual_bytes == features.source_audio_bytes &&
+                                          features.source_audio_sample_rate > 0;
+    }
     if (manifest.contains("design_profile") && manifest["design_profile"].is_object()) {
         const json& profile = manifest["design_profile"];
         features.design_profile.emplace();
@@ -798,6 +842,9 @@ VoiceMetadata VoiceStore::load_metadata(const std::string& id) const {
     metadata.feat_dim = features.feat_dim;
     metadata.created_at = features.created_at;
     metadata.updated_at = features.updated_at;
+    metadata.source_audio_available = features.source_audio_available;
+    metadata.source_audio_bytes = features.source_audio_bytes;
+    metadata.source_audio_sample_rate = features.source_audio_sample_rate;
     if (features.design_profile) {
         metadata.design_profile = *features.design_profile;
     }

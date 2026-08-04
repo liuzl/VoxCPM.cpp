@@ -170,7 +170,15 @@ json metadata_to_json(const VoiceMetadata& metadata) {
         {"feat_dim", metadata.feat_dim},
         {"created_at", metadata.created_at},
         {"updated_at", metadata.updated_at},
+        {"source_audio_available", metadata.source_audio_available},
     };
+    if (metadata.source_audio_available) {
+        body["source_audio"] = {
+            {"format", "wav"},
+            {"bytes", metadata.source_audio_bytes},
+            {"sample_rate", metadata.source_audio_sample_rate},
+        };
+    }
     if (metadata.design_profile) {
         body["design_profile"] = {
             {"description", metadata.design_profile->description},
@@ -557,7 +565,9 @@ int main(int argc, char** argv) {
                 features.design_profile->cfg_value = cfg_value;
                 features.design_profile->timesteps = timesteps;
                 features.design_profile->model = options.model_name;
-                voice_store.save_voice(features);
+                const std::vector<uint8_t> source_wav =
+                    encode_audio(AudioResponseFormat::Wav, designed.waveform, designed.sample_rate);
+                voice_store.save_voice(features, source_wav, designed.sample_rate);
                 saved = true;
                 respond_json(res, 201, metadata_to_json(voice_store.load_metadata(id)));
             } catch (const std::exception& e) {
@@ -601,7 +611,9 @@ int main(int argc, char** argv) {
                 const DecodedAudio decoded = decode_audio_from_memory(file.content.data(), file.content.size());
                 const std::vector<float> mono = convert_to_mono(decoded);
                 PromptFeatures features = core.encode_prompt_audio(id, text, mono, decoded.sample_rate);
-                voice_store.save_voice(features);
+                const std::vector<uint8_t> source_wav =
+                    encode_audio(AudioResponseFormat::Wav, mono, decoded.sample_rate);
+                voice_store.save_voice(features, source_wav, decoded.sample_rate);
                 respond_json(res, 201, metadata_to_json(voice_store.load_metadata(id)));
             } catch (const std::exception& e) {
                 respond_error(res, 400, e.what(), "invalid_request_error", "bad_request");

@@ -136,8 +136,13 @@ TEST_CASE("VoiceStore persists manifest and prompt features round-trip", "[serve
     features.design_profile->timesteps = 8;
     features.design_profile->model = "voxcpm2";
 
-    store.save_voice(features);
+    constexpr int kSourceSampleRate = 16000;
+    const std::vector<float> source_audio(800, 0.125f);
+    const std::vector<uint8_t> source_wav =
+        encode_audio(AudioResponseFormat::Wav, source_audio, kSourceSampleRate);
+    store.save_voice(features, source_wav, kSourceSampleRate);
     REQUIRE(store.has_voice(features.id));
+    REQUIRE(std::filesystem::is_regular_file(root / features.id / "ref.wav"));
 
     const PromptFeatures loaded = store.load_voice(features.id);
     REQUIRE(loaded.id == features.id);
@@ -149,6 +154,9 @@ TEST_CASE("VoiceStore persists manifest and prompt features round-trip", "[serve
     REQUIRE(loaded.sample_rate == features.sample_rate);
     REQUIRE(loaded.patch_size == features.patch_size);
     REQUIRE(loaded.feat_dim == features.feat_dim);
+    REQUIRE(loaded.source_audio_available);
+    REQUIRE(loaded.source_audio_bytes == source_wav.size());
+    REQUIRE(loaded.source_audio_sample_rate == kSourceSampleRate);
     REQUIRE(loaded.design_profile.has_value());
     REQUIRE(loaded.design_profile->description == "warm narrator");
     REQUIRE(loaded.design_profile->seed == 42);
@@ -160,11 +168,43 @@ TEST_CASE("VoiceStore persists manifest and prompt features round-trip", "[serve
     REQUIRE(metadata.id == features.id);
     REQUIRE(metadata.prompt_text == features.prompt_text);
     REQUIRE(metadata.reference_audio_length == features.reference_audio_length);
+    REQUIRE(metadata.source_audio_available);
+    REQUIRE(metadata.source_audio_bytes == source_wav.size());
+    REQUIRE(metadata.source_audio_sample_rate == kSourceSampleRate);
     REQUIRE(metadata.design_profile.has_value());
     REQUIRE(metadata.design_profile->description == "warm narrator");
 
+    std::filesystem::resize_file(root / features.id / "ref.wav", 16);
+    REQUIRE_FALSE(store.load_metadata(features.id).source_audio_available);
+
     store.delete_voice(features.id);
     REQUIRE_FALSE(store.has_voice(features.id));
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("VoiceStore keeps feature-only legacy voices readable", "[server]") {
+    const std::filesystem::path root =
+        std::filesystem::temp_directory_path() / "voxcpm_server_legacy_voice_store_test";
+    std::filesystem::remove_all(root);
+
+    VoiceStore store(root.string());
+    PromptFeatures features;
+    features.id = "legacy_voice";
+    features.prompt_text = "legacy";
+    features.prompt_feat = {1.0f, 2.0f};
+    features.prompt_audio_length = 1;
+    features.sample_rate = 16000;
+    features.patch_size = 1;
+    features.feat_dim = 2;
+    store.save_voice(features);
+
+    const PromptFeatures loaded = store.load_voice(features.id);
+    REQUIRE(loaded.prompt_feat == features.prompt_feat);
+    REQUIRE_FALSE(loaded.source_audio_available);
+    REQUIRE(loaded.source_audio_bytes == 0);
+    REQUIRE(loaded.source_audio_sample_rate == 0);
+    REQUIRE_FALSE(std::filesystem::exists(root / features.id / "ref.wav"));
+
     std::filesystem::remove_all(root);
 }
 

@@ -7,6 +7,8 @@
 #include "voxcpm/voxcpm.h"
 #include "voxcpm/weight-store.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -36,6 +38,9 @@ struct PromptFeatures {
     int feat_dim = 0;
     std::string created_at;
     std::string updated_at;
+    bool source_audio_available = false;
+    size_t source_audio_bytes = 0;
+    int source_audio_sample_rate = 0;
     std::optional<DesignProfileMetadata> design_profile;
 };
 
@@ -49,6 +54,9 @@ struct VoiceMetadata {
     int feat_dim = 0;
     std::string created_at;
     std::string updated_at;
+    bool source_audio_available = false;
+    size_t source_audio_bytes = 0;
+    int source_audio_sample_rate = 0;
     std::optional<DesignProfileMetadata> design_profile;
 };
 
@@ -82,7 +90,12 @@ public:
     explicit VoiceStore(std::string root_dir);
 
     bool has_voice(const std::string& id) const;
-    void save_voice(const PromptFeatures& features);
+    // source_wav is the normalized, mono registration source. Features remain
+    // the hot-path artifact; the WAV is retained only as the portable source
+    // of truth for model upgrades, export, and replica repair.
+    void save_voice(const PromptFeatures& features,
+                    const std::vector<uint8_t>& source_wav = {},
+                    int source_audio_sample_rate = 0);
     PromptFeatures load_voice(const std::string& id) const;
     VoiceMetadata load_metadata(const std::string& id) const;
     // All registered voices with a readable manifest, sorted by id; unreadable
