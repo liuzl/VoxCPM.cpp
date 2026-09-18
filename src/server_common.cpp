@@ -705,6 +705,13 @@ void append_stream_frame(std::vector<float>& recent_frames,
 
 }  // namespace
 
+bool model_supports_reference_audio(const gguf_context* metadata) {
+    if (!metadata) return false;
+    const int64_t key = gguf_find_key(metadata, "voxcpm_architecture");
+    return key >= 0 && gguf_get_kv_type(metadata, key) == GGUF_TYPE_STRING &&
+           std::strcmp(gguf_get_val_str(metadata, key), "voxcpm2") == 0;
+}
+
 VoiceStore::VoiceStore(std::string root_dir)
     : root_dir_(std::move(root_dir)) {
     std::filesystem::create_directories(root_dir_);
@@ -965,6 +972,9 @@ PromptFeatures VoxCPMServiceCore::encode_reference_audio(const std::string& id,
     if (!loaded_) {
         fail("Model core is not loaded");
     }
+    if (!supports_reference_audio()) {
+        fail("Reference audio requires GGUF voxcpm_architecture=voxcpm2");
+    }
     return encode_reference_audio_locked(id, mono_audio, sample_rate);
 }
 
@@ -1099,6 +1109,9 @@ SynthesisResult VoxCPMServiceCore::synthesize(const SynthesisRequest& request) {
 SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& request) {
     if (request.text.empty()) {
         fail("Text input must not be empty");
+    }
+    if (request.prompt.reference_audio_length > 0 && !supports_reference_audio()) {
+        fail("Reference audio requires GGUF voxcpm_architecture=voxcpm2");
     }
     const int patch_size_value = runtime_.config().patch_size;
     const int feat_dim_value = runtime_.config().feat_dim;
@@ -1553,6 +1566,10 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
     }
 
     fail("Retry loop exhausted without producing an accepted sample");
+}
+
+bool VoxCPMServiceCore::supports_reference_audio() const {
+    return store_ && model_supports_reference_audio(store_->gguf());
 }
 
 int VoxCPMServiceCore::sample_rate() const {

@@ -165,6 +165,7 @@ json metadata_to_json(const VoiceMetadata& metadata) {
         {"id", metadata.id},
         {"prompt_text", metadata.prompt_text},
         {"prompt_audio_length", metadata.prompt_audio_length},
+        {"reference_audio_length", metadata.reference_audio_length},
         {"sample_rate", metadata.sample_rate},
         {"patch_size", metadata.patch_size},
         {"feat_dim", metadata.feat_dim},
@@ -312,9 +313,9 @@ RequestContext parse_request(const json& body, const Options& options) {
         !body["continuation_end"].is_boolean()) {
         fail("`continuation_end` must be a boolean");
     }
-    // `prosody_prompt` is likewise accepted without effect: registered voices
-    // here always condition on the reference transcript together with the
-    // audio, which is the prosody_prompt=true behavior voxstudio requests.
+    // `prosody_prompt` is accepted without changing the stored voice mode.
+    // Conditioning is fixed at registration: continuation uses audio + text;
+    // reference uses independently encoded audio without the transcript.
 
     if (body.contains("max-attempts")) {
         ctx.max_attempts = body.value("max-attempts", options.max_attempts);
@@ -590,15 +591,25 @@ int main(int argc, char** argv) {
                 if (!req.form.has_field("id")) {
                     fail("Missing multipart field `id`");
                 }
-                if (!req.form.has_field("text")) {
+                const std::string mode = req.form.has_field("mode") ? req.form.get_field("mode") : "continuation";
+                if (mode != "continuation" && mode != "reference") {
+                    fail("`mode` must be `continuation` or `reference`");
+                }
+                if (mode == "continuation" && !req.form.has_field("text")) {
                     fail("Missing multipart field `text`");
                 }
                 if (!req.form.has_file("audio")) {
                     fail("Missing multipart file `audio`");
                 }
 
+                if (mode == "reference" && !core.supports_reference_audio()) {
+                    fail("Reference mode requires GGUF voxcpm_architecture=voxcpm2");
+                }
                 const std::string id = req.form.get_field("id");
-                const std::string text = req.form.get_field("text");
+                const std::string text = req.form.has_field("text") ? req.form.get_field("text") : "";
+                if (mode == "continuation" && text.find_first_not_of(" \t\n\r\f\v") == std::string::npos) {
+                    fail("Continuation mode requires a non-empty transcript");
+                }
                 if (!is_valid_voice_id(id)) {
                     fail("Invalid voice id");
                 }
@@ -610,7 +621,12 @@ int main(int argc, char** argv) {
                 const auto file = req.form.get_file("audio");
                 const DecodedAudio decoded = decode_audio_from_memory(file.content.data(), file.content.size());
                 const std::vector<float> mono = convert_to_mono(decoded);
-                PromptFeatures features = core.encode_prompt_audio(id, text, mono, decoded.sample_rate);
+                // Reference and continuation have different patch padding and token
+                // placement. Encode through the actual reference path; never relabel
+                // left-padded continuation features as reference features.
+                PromptFeatures features = mode == "reference"
+                    ? core.encode_reference_audio(id, mono, decoded.sample_rate)
+                    : core.encode_prompt_audio(id, text, mono, decoded.sample_rate);
                 const std::vector<uint8_t> source_wav =
                     encode_audio(AudioResponseFormat::Wav, mono, decoded.sample_rate);
                 voice_store.save_voice(features, source_wav, decoded.sample_rate);

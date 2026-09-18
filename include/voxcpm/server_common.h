@@ -18,6 +18,10 @@
 
 namespace voxcpm {
 
+// Uses the exported model contract, not a display name or CLI alias. Unknown
+// architectures fail closed; older GGUFs need re-exported architecture metadata.
+bool model_supports_reference_audio(const gguf_context* metadata);
+
 struct DesignProfileMetadata {
     std::string description;
     int64_t seed = 0;
@@ -127,6 +131,7 @@ public:
     int patch_size() const;
     int feat_dim() const;
     bool loaded() const { return loaded_; }
+    bool supports_reference_audio() const;
 
 private:
     PromptFeatures encode_prompt_audio_locked(const std::string& id,

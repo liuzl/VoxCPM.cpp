@@ -208,6 +208,48 @@ TEST_CASE("VoiceStore keeps feature-only legacy voices readable", "[server]") {
     std::filesystem::remove_all(root);
 }
 
+TEST_CASE("Reference capability is pinned to model architecture metadata", "[server]") {
+    REQUIRE_FALSE(model_supports_reference_audio(nullptr));
+    auto* metadata = gguf_init_empty();
+    REQUIRE(metadata != nullptr);
+    // A friendly name alone cannot opt an unknown/older model into reference mode.
+    gguf_set_val_str(metadata, "general.name", "VoxCPM2");
+    REQUIRE_FALSE(model_supports_reference_audio(metadata));
+    gguf_set_val_u32(metadata, "voxcpm_architecture", 2);
+    REQUIRE_FALSE(model_supports_reference_audio(metadata));
+    for (const char* architecture : {"", "voxcpm", "voxcpm1.5", "unknown"}) {
+        gguf_set_val_str(metadata, "voxcpm_architecture", architecture);
+        REQUIRE_FALSE(model_supports_reference_audio(metadata));
+    }
+    gguf_set_val_str(metadata, "voxcpm_architecture", "voxcpm2");
+    REQUIRE(model_supports_reference_audio(metadata));
+    gguf_free(metadata);
+}
+
+TEST_CASE("VoiceStore preserves reference-only conditioning without prompt text", "[server]") {
+    const auto root = std::filesystem::temp_directory_path() / "voxcpm_reference_only_store_test";
+    std::filesystem::remove_all(root);
+    VoiceStore store(root.string());
+    PromptFeatures features;
+    features.id = "reference_only";
+    features.reference_feat = {1.0f, 2.0f, 3.0f, 4.0f};
+    features.reference_audio_length = 1;
+    features.sample_rate = 16000;
+    features.patch_size = 2;
+    features.feat_dim = 2;
+    store.save_voice(features);
+    const auto loaded = store.load_voice(features.id);
+    REQUIRE(loaded.prompt_text.empty());
+    REQUIRE(loaded.prompt_feat.empty());
+    REQUIRE(loaded.prompt_audio_length == 0);
+    REQUIRE(loaded.reference_feat == features.reference_feat);
+    REQUIRE(loaded.reference_audio_length == 1);
+    const auto metadata = store.load_metadata(features.id);
+    REQUIRE(metadata.reference_audio_length == 1);
+    REQUIRE(metadata.prompt_audio_length == 0);
+    std::filesystem::remove_all(root);
+}
+
 TEST_CASE("Service synthesize runs end-to-end with encoded prompt audio", "[server][integration]") {
     const std::string model_path = get_model_path();
     REQUIRE(std::filesystem::exists(model_path));
@@ -232,18 +274,22 @@ TEST_CASE("Service synthesize runs end-to-end with encoded prompt audio", "[serv
     REQUIRE(prompt.prompt_feat.size() ==
             static_cast<size_t>(prompt.prompt_audio_length * prompt.patch_size * prompt.feat_dim));
 
-    PromptFeatures reference = service.encode_reference_audio("voice_ref", mono_audio, kInputSampleRate);
-    REQUIRE(reference.reference_audio_length > 0);
-    REQUIRE(reference.prompt_audio_length == 0);
-    REQUIRE(reference.prompt_text.empty());
-    REQUIRE(reference.sample_rate == prompt.sample_rate);
-    REQUIRE(reference.patch_size == service.patch_size());
-    REQUIRE(reference.feat_dim == service.feat_dim());
-    REQUIRE(reference.reference_feat.size() ==
-            static_cast<size_t>(reference.reference_audio_length * reference.patch_size * reference.feat_dim));
+    if (service.supports_reference_audio()) {
+        PromptFeatures reference = service.encode_reference_audio("voice_ref", mono_audio, kInputSampleRate);
+        REQUIRE(reference.reference_audio_length > 0);
+        REQUIRE(reference.prompt_audio_length == 0);
+        REQUIRE(reference.prompt_text.empty());
+        REQUIRE(reference.sample_rate == prompt.sample_rate);
+        REQUIRE(reference.patch_size == service.patch_size());
+        REQUIRE(reference.feat_dim == service.feat_dim());
+        REQUIRE(reference.reference_feat.size() ==
+                static_cast<size_t>(reference.reference_audio_length * reference.patch_size * reference.feat_dim));
 
-    prompt.reference_feat = reference.reference_feat;
-    prompt.reference_audio_length = reference.reference_audio_length;
+        prompt.reference_feat = reference.reference_feat;
+        prompt.reference_audio_length = reference.reference_audio_length;
+    } else {
+        REQUIRE_THROWS(service.encode_reference_audio("voice_ref", mono_audio, kInputSampleRate));
+    }
 
     int chunk_count = 0;
     size_t last_chunk_size = 0;

@@ -157,7 +157,8 @@ Example response:
 Registers a reusable voice entry by uploading:
 
 - multipart field `id`: required, unique voice id
-- multipart field `text`: required, transcript for the reference audio
+- multipart field `mode`: optional, `continuation` (default) or `reference` (VoxCPM2)
+- multipart field `text`: required and nonblank for `continuation`; unused for `reference`
 - multipart file `audio`: required, reference audio file
 
 Success response: `201 Created`
@@ -167,11 +168,31 @@ Returned JSON fields:
 - `id`
 - `prompt_text`
 - `prompt_audio_length`
+- `reference_audio_length`
 - `sample_rate`
 - `patch_size`
 - `feat_dim`
 - `created_at`
 - `updated_at`
+
+Reference registration and synthesis require the GGUF model contract
+`voxcpm_architecture=voxcpm2`. Missing, unknown or older architecture metadata is
+rejected; a display name or `--model-name` cannot enable this capability. Re-export
+older VoxCPM2 artifacts with architecture metadata rather than renaming them.
+
+With `mode=reference`, registration uses the native reference encoder (right-padded
+patches) and synthesis conditions on audio between reference tokens, without
+prepending a transcript. Readback has `prompt_audio_length=0` and a positive
+`reference_audio_length`. This can be useful for cross-language cloning, but does
+not guarantee pronunciation quality. Existing registrations and omitted `mode`
+keep continuation behavior. Register a separate ID to compare modes; registration
+does not overwrite an existing voice. `prosody_prompt` on speech requests does not
+switch the stored mode. Streaming and batch synthesis use the same stored features.
+
+```bash
+curl http://127.0.0.1:8080/v1/voices \
+  -F id=alice-reference -F mode=reference -F audio=@reference.wav
+```
 
 #### `GET /v1/voices/{id}`
 

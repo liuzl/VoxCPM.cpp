@@ -470,6 +470,8 @@ enum class BufferUsage {
 
 - `2026-09-18`: `synthesize` 在请求结束时归还 per-request compute arena（RAII，覆盖异常路径），复用既有的 `reset_request_state`；此前该重置只在请求开始时执行，最后一次生成的 arena 会一直驻留到下一个请求到来。未新增所有权语义、未改动热路径。CUDA 实测（GB10 / sm_121，Q4_K 模型）：生成 85.44 s 音频后空闲 60 s，常驻从 10,649 MiB 降至 4,160 MiB，归还约 6.5 GiB；基线 3,371 MiB 不变。对应 `Success Criteria` 中的 bounded `weights + KV/state/output + compute arena`。
 
+- `2026-09-14`: HTTP voice registration exposes the existing reference-only encoder through `mode=reference`; omitted mode preserves continuation. No changes to shared weights, state ownership, decode graphs, or hot-path transfers. GGUF architecture gating and nonblank continuation validation now have unit/HTTP regressions; the [paired canary](docs/reference-only-canary.md) does not qualify an acoustic rollout.
+
 - `2026-04-02`: 阶段一完成；阶段四已进入 persistent-first 主路径；latent sequence 开始进入 output lifecycle。
 - `2026-04-02`: `audio_frame_count` 已进入 decode state；`server_common` 已可优先从 `output_pool.latent_seq` 导出 AudioVAE latent。
 - `2026-04-02`: `server_common` 默认不再把 `generated_steps` 作为主时间线，改为优先使用 `output_pool.latent_seq`，host vectors 仅保留 fallback。
