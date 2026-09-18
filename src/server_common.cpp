@@ -1040,11 +1040,59 @@ PromptFeatures VoxCPMServiceCore::encode_reference_audio_locked(const std::strin
     return features;
 }
 
+namespace {
+
+/**
+ * Return the per-request compute arena when the work is finished, rather than leaving it
+ * held until the next caller arrives.
+ *
+ * `reset_request_state` already runs at the start of every synthesis, so the arena is
+ * rebuilt per request either way and releasing it here costs nothing in steady state.
+ * What it changes is the idle footprint: without this, the arena reserved for the last
+ * request stays resident indefinitely. Measured on one deployment, a 41-second utterance
+ * left roughly 7 GiB of device memory held with the process idle, and it came back only
+ * when some later request happened to reset it.
+ *
+ * That matters wherever this server shares a device. A co-tenant cannot use memory this
+ * process is no longer using but has not given back, and the amount is set by the longest
+ * utterance ever synthesized rather than by anything happening now.
+ *
+ * Runs on every exit, including the exceptional ones: a request that failed part-way has
+ * reserved just as much as one that succeeded.
+ */
+class RequestArenaRelease {
+public:
+    RequestArenaRelease(VoxCPMRuntime& runtime, VoxCPMBackend* backend)
+        : runtime_(runtime), backend_(backend) {}
+
+    ~RequestArenaRelease() {
+        // A destructor may not throw, and failing to return memory is not worth
+        // terminating a server that has otherwise produced a valid answer.
+        try {
+            runtime_.reset_request_state();
+            if (backend_ != nullptr) {
+                backend_->reset_request_state();
+            }
+        } catch (...) {
+        }
+    }
+
+    RequestArenaRelease(const RequestArenaRelease&) = delete;
+    RequestArenaRelease& operator=(const RequestArenaRelease&) = delete;
+
+private:
+    VoxCPMRuntime& runtime_;
+    VoxCPMBackend* backend_;
+};
+
+}  // namespace
+
 SynthesisResult VoxCPMServiceCore::synthesize(const SynthesisRequest& request) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!loaded_) {
         fail("Model core is not loaded");
     }
+    const RequestArenaRelease release_arena(runtime_, backend_.get());
     return synthesize_locked(request);
 }
 
