@@ -150,6 +150,7 @@ TEST_CASE("VoiceStore persists manifest and prompt features round-trip", "[serve
     REQUIRE(loaded.prompt_feat == features.prompt_feat);
     REQUIRE(loaded.prompt_audio_length == features.prompt_audio_length);
     REQUIRE(loaded.reference_feat == features.reference_feat);
+    REQUIRE(loaded.encoder_contract == features.encoder_contract);
     REQUIRE(loaded.reference_audio_length == features.reference_audio_length);
     REQUIRE(loaded.sample_rate == features.sample_rate);
     REQUIRE(loaded.patch_size == features.patch_size);
@@ -232,6 +233,7 @@ TEST_CASE("VoiceStore preserves reference-only conditioning without prompt text"
     VoiceStore store(root.string());
     PromptFeatures features;
     features.id = "reference_only";
+    features.encoder_contract = "audiovae-v2-causal-padding-1";
     features.reference_feat = {1.0f, 2.0f, 3.0f, 4.0f};
     features.reference_audio_length = 1;
     features.sample_rate = 16000;
@@ -246,6 +248,7 @@ TEST_CASE("VoiceStore preserves reference-only conditioning without prompt text"
     REQUIRE(loaded.reference_audio_length == 1);
     const auto metadata = store.load_metadata(features.id);
     REQUIRE(metadata.reference_audio_length == 1);
+    REQUIRE(metadata.encoder_contract == features.encoder_contract);
     REQUIRE(metadata.prompt_audio_length == 0);
     std::filesystem::remove_all(root);
 }
@@ -497,6 +500,14 @@ TEST_CASE("Request arenas are released after encoding, truncation and callback f
     request.seed = 7;
     request.inference_timesteps = 1;
     request.max_decode_steps = 1;
+    if (service.supports_reference_audio()) {
+        auto legacy = request;
+        legacy.prompt.encoder_contract.clear();
+        REQUIRE_THROWS_WITH(service.synthesize(legacy),
+            "Voice encoder contract is stale or incompatible; re-register the saved ref.wav under a new voice id");
+        legacy.prompt.encoder_contract = "audiovae-future-unknown";
+        REQUIRE_THROWS(service.synthesize(legacy));
+    }
     const auto partial = service.synthesize(request);
     REQUIRE(partial.truncated);
     REQUIRE(partial.generated_frames == 1);

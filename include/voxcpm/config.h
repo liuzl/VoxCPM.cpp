@@ -37,6 +37,10 @@ struct AudioVAEConfig {
     int latent_dim = 64;        // Latent space dimension
     int decoder_dim = 1536;     // Upstream torch default decoder channel dimension
 
+    // V2 encoder strided convs subtract stride % 2 from their left padding.
+    // This is an operator contract selected from GGUF architecture metadata.
+    bool encoder_v2_padding = false;
+
     // Sampling
     int sample_rate = 16000;    // Upstream torch default sample rate (Hz)
     int out_sample_rate = 0;    // Optional decode/output sample rate (Hz)

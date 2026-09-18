@@ -43,6 +43,7 @@ struct PromptFeatures {
     int feat_dim = 0;
     std::string created_at;
     std::string updated_at;
+    std::string encoder_contract;
     bool source_audio_available = false;
     size_t source_audio_bytes = 0;
     int source_audio_sample_rate = 0;
@@ -59,6 +60,7 @@ struct VoiceMetadata {
     int feat_dim = 0;
     std::string created_at;
     std::string updated_at;
+    std::string encoder_contract;
     bool source_audio_available = false;
     size_t source_audio_bytes = 0;
     int source_audio_sample_rate = 0;

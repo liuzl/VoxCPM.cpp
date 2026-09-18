@@ -103,6 +103,7 @@ def main():
                     assert (result["prompt_audio_length"] == 0) == is_reference
                     assert (result["reference_audio_length"] > 0) == is_reference
                     assert result["prompt_text"] == ("" if is_reference else text)
+                    assert result["encoder_contract"] == "audiovae-v2-causal-padding-1"
                     assert (voices / voice_id / "ref.wav").is_file()
                 assert (voices / "legacy/prompt_feat.bin").read_bytes() == (voices / "explicit/prompt_feat.bin").read_bytes()
                 ref = (voices / "reference/reference_feat.bin").read_bytes()
@@ -128,7 +129,30 @@ def main():
                         assert all(math.isfinite(x[0]) for x in struct.iter_unpack("<f", data))
                     else:
                         assert data[:4] == b"RIFF" and len(data) > 44
-                print("PASS: registration validation, mode isolation, source retention, restart, legacy WAV, reference WAV/PCM")
+                # Simulate a pre-fix cache. Metadata remains readable; synthesis must
+                # fail before consuming it, and explicit re-encoding preserves the old ID.
+                old_manifest = voices / "reference/manifest.json"
+                legacy = json.loads(old_manifest.read_text())
+                legacy.pop("encoder_contract")
+                old_manifest.write_text(json.dumps(legacy))
+                before_rebuild = {p.name: p.read_bytes() for p in (voices / "reference").iterdir()}
+                status, result, _ = request("/v1/audio/speech", json.dumps({
+                    "model": "test", "input": "你好。", "voice": "reference", "response_format": "wav",
+                }).encode())
+                assert status == 400 and b"re-register" in result, (status, result)
+                rebuilt = subprocess.check_output([
+                    "python3", str(Path(__file__).resolve().parents[1] / "scripts/reencode_voice.py"),
+                    "--voice-dir", str(voices), "--voice-id", "reference", "--new-id", "reference_rebuilt",
+                    "--url", base,
+                ], text=True)
+                assert json.loads(rebuilt)["encoder_contract"] == "audiovae-v2-causal-padding-1"
+                assert before_rebuild == {p.name: p.read_bytes() for p in (voices / "reference").iterdir()}
+                status, data, _ = request("/v1/audio/speech", json.dumps({
+                    "model": "test", "input": "你好。", "voice": "reference_rebuilt",
+                    "response_format": "wav", "seed": 7,
+                }).encode())
+                assert status == 200 and data[:4] == b"RIFF", (status, data[:200])
+                print("PASS: registration, restart, WAV/PCM, stale-cache rejection, new-ID rebuild with old entry preserved")
             except Exception:
                 log.flush()
                 log.seek(0)

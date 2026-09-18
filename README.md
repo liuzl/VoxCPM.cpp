@@ -180,6 +180,10 @@ Reference registration and synthesis require the GGUF model contract
 rejected; a display name or `--model-name` cannot enable this capability. Re-export
 older VoxCPM2 artifacts with architecture metadata rather than renaming them.
 
+V2 voice features made before the encoder padding fix must be rebuilt from source
+audio under a new ID. The server reports `encoder_contract` and rejects stale
+features; see [encoder parity and voice migration](docs/audiovae-encoder-padding.md).
+
 With `mode=reference`, registration uses the native reference encoder (right-padded
 patches) and synthesis conditions on audio between reference tokens, without
 prepending a transcript. Readback has `prompt_audio_length=0` and a positive

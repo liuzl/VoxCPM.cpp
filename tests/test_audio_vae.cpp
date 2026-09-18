@@ -22,6 +22,13 @@ using json = nlohmann::json;
 using Catch::Approx;
 
 namespace voxcpm {
+struct AudioVAETestAccess {
+    static ggml_tensor* conv(AudioVAE& vae, ggml_context* ctx, ggml_tensor* x, ggml_tensor* w,
+                             int kernel, int stride, int padding, int output_padding) {
+        return vae.causal_conv1d(ctx, x, w, nullptr, kernel, stride, 1, padding, output_padding);
+    }
+    static void set_v2_padding(AudioVAE& vae, bool enabled) { vae.config_.encoder_v2_padding = enabled; }
+};
 namespace test {
 
 namespace {
@@ -687,6 +694,112 @@ TEST_CASE("AudioVAE stateful streaming decode CUDA matches full decode", "[audio
     print_error_stats("AudioVAE stateful streaming decode CUDA vs full decode", latent_input, expected, streamed, stats, kCudaSmokeMaxDiff);
     INFO("stateful streaming vs full decode CUDA max_abs_diff = " << stats.max_abs_diff);
     REQUIRE(stats.max_abs_diff <= kCudaSmokeMaxDiff);
+}
+
+
+TEST_CASE("AudioVAE causal strided convolution preserves V1 and V2 alignment", "[audio_vae][padding]") {
+    for (int stride : {2, 3, 5, 7, 8}) {
+        for (bool v2 : {false, true}) {
+            CAPTURE(stride, v2);
+            VoxCPMBackend backend(BackendType::CPU, 2);
+            VoxCPMContext weights(ContextType::Weights, 32);
+            VoxCPMContext graph_ctx(ContextType::Graph, 512, 2048);
+            AudioVAE vae;
+            const int kernel = stride * 2;
+            const int samples = 43;
+            auto* weight = weights.new_tensor_3d(GGML_TYPE_F32, kernel, 2, 2);
+            auto buffer = backend.alloc_buffer(weights.raw_context(), BufferUsage::Weights);
+            std::vector<float> w(kernel * 4), input(samples * 2);
+            for (size_t i = 0; i < w.size(); ++i) w[i] = (static_cast<int>(i % 11) - 5) * 0.125f;
+            for (size_t i = 0; i < input.size(); ++i) input[i] = (static_cast<int>(i % 17) - 8) * 0.25f;
+            backend.tensor_set(weight, w.data(), 0, w.size() * sizeof(float));
+            auto* x = graph_ctx.new_tensor_3d(GGML_TYPE_F32, samples, 2, 1);
+            ggml_set_input(x);
+            const int padding = (stride + 1) / 2;
+            auto* output = AudioVAETestAccess::conv(vae, graph_ctx.raw_context(), x, weight,
+                                                    kernel, stride, padding, v2 ? stride % 2 : 0);
+            run_graph_with_timing(graph_ctx, backend, output, [&]() {
+                backend.tensor_set(x, input.data(), 0, input.size() * sizeof(float));
+            });
+            // Independent cross-correlation oracle; no GGML layout/padding helpers.
+            const int left = v2 ? stride : 2 * ((stride + 1) / 2);
+            const int frames = (samples + left - kernel) / stride + 1;
+            REQUIRE(output->ne[0] == frames);
+            std::vector<float> actual(frames * 2);
+            backend.tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+            for (int oc = 0; oc < 2; ++oc) {
+                for (int t = 0; t < frames; ++t) {
+                    float expected = 0;
+                    for (int ic = 0; ic < 2; ++ic) {
+                        for (int k = 0; k < kernel; ++k) {
+                            const int source = t * stride + k - left;
+                            if (source >= 0 && source < samples) {
+                                expected += input[ic * samples + source] * w[(oc * 2 + ic) * kernel + k];
+                            }
+                        }
+                    }
+                    REQUIRE(actual[oc * frames + t] == Approx(expected).margin(1e-5));
+                }
+            }
+            backend.free_buffer(buffer);
+        }
+    }
+}
+
+TEST_CASE("AudioVAE encoder matches official Python with identical GGUF weights", "[audio_vae][encoder-parity]") {
+    const char* fixture = std::getenv("VOXCPM_ENCODER_PARITY_JSON");
+    if (!fixture) SKIP("Set VOXCPM_ENCODER_PARITY_JSON using scripts/export_encoder_parity.py");
+    std::ifstream stream(fixture);
+    REQUIRE(stream.is_open());
+    const json traces = json::parse(stream);
+    REQUIRE(traces.at("schema") == "voxcpm.encoder-parity.v1");
+    REQUIRE(traces.at("cases").size() == 8);
+    BackendType type = BackendType::CPU;
+    if (const char* name = std::getenv("VOXCPM_TEST_BACKEND")) {
+        REQUIRE((std::string(name) == "cpu" || std::string(name) == "metal" || std::string(name) == "cuda"));
+        if (std::string(name) == "metal") type = BackendType::Metal;
+        if (std::string(name) == "cuda") type = BackendType::CUDA;
+    }
+    VoxCPMBackend backend(type, 2);
+    VoxCPMContext weight_ctx(ContextType::Weights, 512);
+    VoxCPMContext load_ctx(ContextType::Graph, 512, 2048);
+    AudioVAE vae;
+    REQUIRE(vae.load_from_gguf(get_model_path(), weight_ctx, load_ctx, backend));
+    REQUIRE(vae.config().encoder_v2_padding);
+    const int sample_rate = traces.at("sample_rate");
+    for (const auto& trace : traces.at("cases")) {
+        CAPTURE(trace.at("name"));
+        std::vector<float> input = trace.at("audio").get<std::vector<float>>();
+        const auto expected = trace.at("latent").get<std::vector<float>>();
+        auto run = [&](bool v2) {
+            AudioVAETestAccess::set_v2_padding(vae, v2);
+            VoxCPMContext graph_ctx(ContextType::Graph, 65536, 262144);
+            auto* latent = vae.encode(graph_ctx, backend, input, sample_rate);
+            REQUIRE(latent->ne[0] == trace.at("shape").at(2).get<int>());
+            REQUIRE(latent->ne[1] == trace.at("shape").at(1).get<int>());
+            run_graph_with_timing(graph_ctx, backend, latent, [&]() {
+                backend.tensor_set(vae.last_input_tensor(), vae.last_preprocessed_audio().data(), 0,
+                                   vae.last_preprocessed_audio().size() * sizeof(float));
+            });
+            std::vector<float> result(expected.size());
+            backend.tensor_get(latent, result.data(), 0, result.size() * sizeof(float));
+            backend.reset_request_state();
+            return result;
+        };
+        const bool v2 = trace.at("v2");
+        const auto actual = run(v2);
+        REQUIRE(all_finite(actual));
+        const auto stats = compute_error_stats(actual, expected);
+        std::cout << trace.at("name") << " max_abs=" << stats.max_abs_diff << " rmse=" << stats.rmse;
+        if (v2) {
+            const auto old = compute_error_stats(run(false), expected);
+            std::cout << " legacy_padding_rmse=" << old.rmse;
+            REQUIRE(old.rmse > stats.rmse * 10);
+        }
+        std::cout << "\n";
+        CHECK(stats.max_abs_diff < 0.002f);
+        CHECK(stats.rmse < 0.0002f);
+    }
 }
 
 }  // namespace test

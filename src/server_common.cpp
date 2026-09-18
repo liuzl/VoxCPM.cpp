@@ -741,6 +741,7 @@ void VoiceStore::save_voice(const PromptFeatures& features,
         {"feat_dim", features.feat_dim},
         {"created_at", features.created_at},
         {"updated_at", features.updated_at},
+        {"encoder_contract", features.encoder_contract},
     };
     if (!source_wav.empty()) {
         if (source_audio_sample_rate <= 0) {
@@ -806,6 +807,7 @@ PromptFeatures VoiceStore::load_voice(const std::string& id) const {
     features.feat_dim = manifest.at("feat_dim").get<int>();
     features.created_at = manifest.value("created_at", "");
     features.updated_at = manifest.value("updated_at", "");
+    features.encoder_contract = manifest.value("encoder_contract", "");
     if (manifest.contains("source_audio") && manifest["source_audio"].is_object()) {
         const json& source = manifest["source_audio"];
         const auto source_path = source_audio_path_for(root_dir_, id);
@@ -849,6 +851,7 @@ VoiceMetadata VoiceStore::load_metadata(const std::string& id) const {
     metadata.feat_dim = features.feat_dim;
     metadata.created_at = features.created_at;
     metadata.updated_at = features.updated_at;
+    metadata.encoder_contract = features.encoder_contract;
     metadata.source_audio_available = features.source_audio_available;
     metadata.source_audio_bytes = features.source_audio_bytes;
     metadata.source_audio_sample_rate = features.source_audio_sample_rate;
@@ -1020,6 +1023,7 @@ PromptFeatures VoxCPMServiceCore::encode_prompt_audio_locked(const std::string& 
 
     PromptFeatures features;
     features.id = id;
+    features.encoder_contract = audio_vae_.encoder_contract();
     features.prompt_text = prompt_text;
     features.prompt_feat = extract_prompt_features(audio_vae_,
                                                    audio_vae_backend(),
@@ -1056,6 +1060,7 @@ PromptFeatures VoxCPMServiceCore::encode_reference_audio_locked(const std::strin
 
     PromptFeatures features;
     features.id = id;
+    features.encoder_contract = audio_vae_.encoder_contract();
     features.reference_feat = extract_prompt_features(audio_vae_,
                                                       audio_vae_backend(),
                                                       resampled,
@@ -1094,6 +1099,11 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
     }
     if (request.prompt.reference_audio_length > 0 && !supports_reference_audio()) {
         fail("Reference audio requires GGUF voxcpm_architecture=voxcpm2");
+    }
+    const bool has_features = request.prompt.prompt_audio_length > 0 || request.prompt.reference_audio_length > 0;
+    if (has_features && (audio_vae_.config().encoder_v2_padding || !request.prompt.encoder_contract.empty()) &&
+        request.prompt.encoder_contract != audio_vae_.encoder_contract()) {
+        fail("Voice encoder contract is stale or incompatible; re-register the saved ref.wav under a new voice id");
     }
     const int patch_size_value = runtime_.config().patch_size;
     const int feat_dim_value = runtime_.config().feat_dim;

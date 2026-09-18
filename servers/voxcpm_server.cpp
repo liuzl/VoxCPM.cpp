@@ -166,6 +166,7 @@ json metadata_to_json(const VoiceMetadata& metadata) {
         {"prompt_text", metadata.prompt_text},
         {"prompt_audio_length", metadata.prompt_audio_length},
         {"reference_audio_length", metadata.reference_audio_length},
+        {"encoder_contract", metadata.encoder_contract},
         {"sample_rate", metadata.sample_rate},
         {"patch_size", metadata.patch_size},
         {"feat_dim", metadata.feat_dim},

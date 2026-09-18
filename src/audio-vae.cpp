@@ -557,6 +557,9 @@ bool AudioVAE::load_from_store(const std::shared_ptr<VoxCPMWeightStore>& store) 
     }
 
     shared_store_ = store;
+    std::string architecture;
+    store->get_string("voxcpm_architecture", architecture);
+    config_.encoder_v2_padding = architecture == "voxcpm2";
 
     uint32_t u32 = 0;
     const bool has_encoder_dim = store->get_u32("voxcpm_audio_vae_config_encoder_dim", u32);
@@ -613,11 +616,14 @@ ggml_tensor* AudioVAE::causal_conv1d(ggml_context* ctx,
                                      int kernel_size,
                                      int stride,
                                      int dilation,
-                                     int padding) const {
-    ggml_tensor* padded = x;
-    if (padding > 0) {
-        padded = left_pad_1d(ctx, x, padding * 2);
-    }
+                                     int padding,
+                                     int output_padding) const {
+    // Torch [B,C,T] corresponds to GGML [T,C,B]; weights [OC,IC,K] are
+    // stored [K,IC,OC]. Crop the causal left padding before im2col, not the
+    // output: equal output shapes can still hide a one-sample phase shift.
+    const int left_padding = padding * 2 - output_padding;
+    VOXCPM_ASSERT(left_padding >= 0);
+    ggml_tensor* padded = left_pad_1d(ctx, x, left_padding);
     ggml_tensor* result = conv1d_mul_mat_impl(ctx, weight, padded, kernel_size, stride, dilation);
     if (bias) {
         result = ggml_add(ctx, result, reshape_bias_3d(ctx, bias));
@@ -897,7 +903,8 @@ ggml_tensor* AudioVAE::encoder_block_forward(ggml_context* ctx,
         stride * 2,
         stride,
         1,
-        static_cast<int>(std::ceil(stride / 2.0f)));
+        static_cast<int>(std::ceil(stride / 2.0f)),
+        config_.encoder_v2_padding ? stride % 2 : 0);
 }
 
 ggml_tensor* AudioVAE::decoder_block_forward(ggml_context* ctx,

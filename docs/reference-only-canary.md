@@ -2,6 +2,9 @@
 
 Date: 2026-09-14. Status: API verified; acoustic migration not qualified.
 
+This canary predates the [V2 encoder padding correction](audiovae-encoder-padding.md).
+Its acoustic measurements do not qualify features rebuilt with the corrected encoder.
+
 `POST /v1/voices` now exposes the existing reference encoder with
 `mode=reference`. Omitted mode preserves continuation registration. The reference
 path right-pads audio patches and stores reference features without a transcript;

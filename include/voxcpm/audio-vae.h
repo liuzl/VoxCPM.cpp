@@ -161,6 +161,9 @@ public:
     void prepare_decode_inputs(VoxCPMBackend& backend) const;
 
     const AudioVAEConfig& config() const { return config_; }
+    const char* encoder_contract() const {
+        return config_.encoder_v2_padding ? "audiovae-v2-causal-padding-1" : "audiovae-v1-causal-padding-1";
+    }
     const AudioVAEWeights& weights() const { return weights_; }
     ggml_tensor* last_input_tensor() const { return last_input_tensor_; }
     ggml_tensor* last_decode_sr_cond_tensor() const { return last_decode_sr_cond_tensor_; }
@@ -170,6 +173,7 @@ public:
     bool uses_shared_weights() const { return shared_store_ != nullptr; }
 
 private:
+    friend struct AudioVAETestAccess;
     ggml_tensor* causal_conv1d(ggml_context* ctx,
                                ggml_tensor* x,
                                ggml_tensor* weight,
@@ -177,7 +181,8 @@ private:
                                int kernel_size,
                                int stride,
                                int dilation,
-                               int padding) const;
+                               int padding,
+                               int output_padding = 0) const;
 
     ggml_tensor* causal_conv1d_stateful(ggml_context* ctx,
                                         ggml_tensor* x,

@@ -329,6 +329,8 @@ enum class BufferUsage {
 
 ## 10. 当前任务进度
 
+- `2026-09-18` V2 编码器奇数 stride 的 padding 对齐官方公式；V1 数值路径保留。算子独立 oracle 与同权重 CPU/F32 编码器对拍通过；CPU/F16 与 Metal 数值差异单列，未声称音质/CUDA 验收。声音特征增加 encoder contract，旧 V2 缓存拒绝用于推理，通过源音频显式重建到新 ID。见 [验证与迁移](docs/audiovae-encoder-padding.md)。
+
 - `2026-09-18` 请求边界补全：注册/合成及异常退出释放 main、AudioVAE、stream compute arena；异步 CPU chunk 限定 Metal 共享内存。截断结果显式标记，HTTP 拒绝成功返回不完整音频；server 默认预算 1024。真实模型生命周期回归已通过 Metal 与独立 CPU AudioVAE 两种配置（每种 19 个断言，完成/截断/异常后 compute arena 均为 0）；WAV/SSE/PCM HTTP 截断回归通过。CUDA 实机复测待执行；未增加热路径 host-vector 往返。
 
 维护规则：
