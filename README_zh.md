@@ -320,7 +320,7 @@ CUDA 示例：
   --disable-auth
 ```
 
-服务长文本时可以设置 `--max-decode-steps`。不设置或设为 `0` 时，服务端会继续使用保守的后端默认 decode 预算。
+服务长文本时可以设置 `--max-decode-steps`。默认预算为 1024 步；显式设为 `0` 才使用保守的后端启发式预算。触顶且未收到 stop token 时，WAV/SSE 返回 `synthesis_truncated` 错误；已开始的 PCM 流会异常结束，不报告完整传输。
 
 CPU 示例：
 

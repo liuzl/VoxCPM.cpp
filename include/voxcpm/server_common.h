@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace voxcpm {
@@ -83,10 +84,25 @@ struct SynthesisRequest {
     bool skip_final_waveform = false;
 };
 
+class SynthesisTruncated : public std::runtime_error {
+public:
+    SynthesisTruncated() : std::runtime_error(
+        "Decode budget exhausted before the stop token; shorten the input or increase --max-decode-steps") {}
+};
+
+// The CPU worker borrows the main backend's weight/output buffers without copying.
+// Only Metal's host-visible buffers support that contract.
+inline bool supports_async_cpu_chunks(BackendType backend) {
+    return backend == BackendType::Metal;
+}
+
 struct SynthesisResult {
     std::vector<float> waveform;
     int sample_rate = 0;
     int generated_frames = 0;
+    // A bounded partial result is useful to library callers, but is not complete speech.
+    bool truncated = false;
+    void require_complete() const { if (truncated) throw SynthesisTruncated(); }
 };
 
 class VoiceStore {
@@ -127,6 +143,8 @@ public:
                                          int sample_rate);
     SynthesisResult synthesize(const SynthesisRequest& request);
 
+    // Sum of request compute arenas; excludes shared weights and persistent KV/state.
+    size_t compute_buffer_size() const;
     int sample_rate() const;
     int patch_size() const;
     int feat_dim() const;
@@ -147,9 +165,8 @@ private:
     // dedicated CPU backend when the main backend is Metal (see load()).
     VoxCPMBackend& audio_vae_backend() { return vae_backend_ ? *vae_backend_ : *backend_; }
 
-    // Second GPU backend instance (own command queue) that a worker thread
-    // uses to decode streaming chunks concurrently with the LM decode loop.
-    // Null when the main backend is CPU or the VAE is quarantined to CPU.
+    // CPU worker borrowing Metal host-visible weights/output. Never used on CUDA
+    // or Vulkan device buffers, or when AudioVAE already uses its own CPU backend.
     std::unique_ptr<VoxCPMBackend> stream_chunk_backend_;
 
     std::string model_path_;

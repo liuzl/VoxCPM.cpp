@@ -446,3 +446,87 @@ TEST_CASE("Service synthesize handles longer text inputs without graph context e
 
 }  // namespace test
 }  // namespace voxcpm
+
+TEST_CASE("Async CPU chunks only borrow host-visible Metal buffers", "[server]") {
+    using namespace voxcpm;
+    REQUIRE(supports_async_cpu_chunks(BackendType::Metal));
+    for (auto backend : {BackendType::CPU, BackendType::CUDA, BackendType::Vulkan, BackendType::Auto}) {
+        REQUIRE_FALSE(supports_async_cpu_chunks(backend));
+    }
+}
+
+TEST_CASE("Incomplete synthesis cannot be certified as complete", "[server]") {
+    voxcpm::SynthesisResult result;
+    REQUIRE_NOTHROW(result.require_complete());
+    result.truncated = true;
+    REQUIRE_THROWS_AS(result.require_complete(), voxcpm::SynthesisTruncated);
+}
+
+TEST_CASE("Request arenas are released after encoding, truncation and callback failure", "[server][integration][request-lifecycle]") {
+    using namespace voxcpm;
+    const auto model = voxcpm::test::get_model_path();
+    REQUIRE(std::filesystem::exists(model));
+    const char* backend_env = std::getenv("VOXCPM_TEST_BACKEND");
+    BackendType backend = BackendType::CPU;
+    if (backend_env) {
+        const std::string name(backend_env);
+        REQUIRE((name == "cpu" || name == "metal" || name == "cuda"));
+        if (name == "metal") backend = BackendType::Metal;
+        if (name == "cuda") backend = BackendType::CUDA;
+    }
+    VoxCPMServiceCore service(model, backend, 2);
+    service.load();
+    INFO("load-time compute bytes: " << service.compute_buffer_size());
+
+    std::vector<float> audio(1600);
+    for (size_t i = 0; i < audio.size(); ++i) audio[i] = 0.05f * std::sin(i * 0.0864f);
+    const auto prompt = service.encode_prompt_audio("lifecycle", "你好", audio, 16000);
+    REQUIRE_FALSE(prompt.prompt_feat.empty());
+    REQUIRE(service.compute_buffer_size() == 0);
+    if (service.supports_reference_audio()) {
+        const auto reference = service.encode_reference_audio("reference", audio, 16000);
+        REQUIRE_FALSE(reference.reference_feat.empty());
+    } else {
+        REQUIRE_THROWS(service.encode_reference_audio("reference", audio, 16000));
+    }
+    REQUIRE(service.compute_buffer_size() == 0);
+
+    SynthesisRequest request;
+    request.text = "这是用于验证请求结束后内存释放的句子。";
+    request.prompt = prompt;
+    request.seed = 7;
+    request.inference_timesteps = 1;
+    request.max_decode_steps = 1;
+    const auto partial = service.synthesize(request);
+    REQUIRE(partial.truncated);
+    REQUIRE(partial.generated_frames == 1);
+    REQUIRE_FALSE(partial.waveform.empty());
+    REQUIRE(service.compute_buffer_size() == 0);
+
+    request.max_decode_steps = 8;
+    int callbacks = 0;
+    request.chunk_callback = [&](const std::vector<float>&) {
+        if (++callbacks == 2) throw std::runtime_error("consumer cancelled");
+    };
+    REQUIRE_THROWS_WITH(service.synthesize(request), "consumer cancelled");
+    REQUIRE(service.compute_buffer_size() == 0);
+
+    size_t samples = 0;
+    request.skip_final_waveform = true;
+    request.chunk_callback = [&](const std::vector<float>& chunk) { samples += chunk.size(); };
+    const auto streamed = service.synthesize(request);
+    REQUIRE(streamed.generated_frames > 0);
+    REQUIRE(streamed.waveform.empty());
+    REQUIRE(samples > 0);
+    REQUIRE(service.compute_buffer_size() == 0);
+
+    request.text = "你好。";
+    request.max_decode_steps = 1024;
+    request.inference_timesteps = 4;
+    request.chunk_callback = {};
+    request.skip_final_waveform = false;
+    const auto complete = service.synthesize(request);
+    REQUIRE_NOTHROW(complete.require_complete());
+    REQUIRE_FALSE(complete.waveform.empty());
+    REQUIRE(service.compute_buffer_size() == 0);
+}

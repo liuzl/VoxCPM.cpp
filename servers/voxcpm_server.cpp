@@ -37,7 +37,7 @@ struct Options {
     int max_queue = 8;
     int max_attempts = 3;
     int output_sample_rate = 0;
-    int max_decode_steps = 0;
+    int max_decode_steps = 1024;
     int inference_timesteps = 10;
     bool disable_auth = false;
 };
@@ -117,7 +117,7 @@ Options parse_args(int argc, char** argv) {
                 << "  --threads N           Default: 4\n"
                 << "  --max-queue N         Default: 8\n"
                 << "  --max-attempts N      Default: 3\n"
-                << "  --max-decode-steps N  Override per-request decode step cap, 0 keeps backend default\n"
+                << "  --max-decode-steps N  Per-request decode step cap (default 1024); 0 uses backend heuristic\n"
                 << "  --inference-timesteps N  Diffusion steps per chunk. Default: 10. Lower is faster\n"
                 << "  --output-sample-rate HZ  Optional output resample rate before encoding\n"
                 << "  --api-key KEY         Required unless --disable-auth\n"
@@ -469,7 +469,7 @@ int main(int argc, char** argv) {
                     request.prompt = voice_store.load_voice(voices.front().id);
                     request.max_decode_steps = options.max_decode_steps;
                     request.inference_timesteps = options.inference_timesteps;
-                    core.synthesize(request);
+                    core.synthesize(request).require_complete();
                     const double warm_s = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - warm_start).count();
                     std::cerr << "Warmup synthesis (" << voices.front().id << ") done in "
@@ -557,6 +557,7 @@ int main(int argc, char** argv) {
                 design_request.seed = seed;
                 design_request.max_decode_steps = options.max_decode_steps;
                 const SynthesisResult designed = core.synthesize(design_request);
+                designed.require_complete();
 
                 PromptFeatures features = core.encode_prompt_audio(
                     id, anchor_text, designed.waveform, designed.sample_rate);
@@ -571,6 +572,8 @@ int main(int argc, char** argv) {
                 voice_store.save_voice(features, source_wav, designed.sample_rate);
                 saved = true;
                 respond_json(res, 201, metadata_to_json(voice_store.load_metadata(id)));
+            } catch (const SynthesisTruncated& e) {
+                respond_error(res, 500, e.what(), "server_error", "synthesis_truncated");
             } catch (const std::exception& e) {
                 if (saved) {
                     voice_store.delete_voice(id);
@@ -758,7 +761,7 @@ int main(int argc, char** argv) {
 
                     std::thread([state, request = std::move(request), permit = std::move(*permit), &core]() mutable {
                         try {
-                            core.synthesize(request);
+                            core.synthesize(request).require_complete();
                         } catch (const std::exception& e) {
                             std::cerr << "[stream] synthesis failed: " << e.what() << "\n";
                             std::lock_guard<std::mutex> lock(state->mutex);
@@ -817,7 +820,7 @@ int main(int argc, char** argv) {
                         };
                         events.push_back("event: audio.delta\ndata: " + payload.dump() + "\n\n");
                     };
-                    core.synthesize(request);
+                    core.synthesize(request).require_complete();
                     events.push_back("event: audio.completed\ndata: {\"type\":\"audio.completed\"}\n\n");
                     res.set_chunked_content_provider(
                         "text/event-stream",
@@ -843,6 +846,7 @@ int main(int argc, char** argv) {
                 request.retry_badcase = (ctx.max_attempts == 1 ? false : true);
                 request.retry_badcase_max_times = std::min(ctx.max_attempts, options.max_attempts);
                 SynthesisResult result = core.synthesize(request);
+                result.require_complete();
                 result.waveform = prepare_response_waveform(std::move(result.waveform),
                                                             result.sample_rate,
                                                             response_sample_rate,
@@ -850,6 +854,8 @@ int main(int argc, char** argv) {
                 const std::vector<uint8_t> payload = encode_audio(ctx.format, result.waveform, response_sample_rate);
                 res.set_header("Content-Type", audio_content_type(ctx.format));
                 res.set_content(reinterpret_cast<const char*>(payload.data()), payload.size(), audio_content_type(ctx.format));
+            } catch (const SynthesisTruncated& e) {
+                respond_error(res, 500, e.what(), "server_error", "synthesis_truncated");
             } catch (const std::invalid_argument& e) {
                 respond_error(res, 400, e.what(), "invalid_request_error", "unsupported_parameter");
             } catch (const std::exception& e) {

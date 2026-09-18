@@ -12,6 +12,8 @@ This file is a focused walkthrough for building and running VoxCPM.cpp with the 
 
 For the CUDA service path, current request budgeting is:
 
+With `--max-decode-steps 0` (the HTTP default is 1024):
+
 - `seq_len <= 256`: output-pool fast path, decode cap 128 steps
 - `257-512`: fallback path, decode cap 96 steps
 - `>512`: chunked prefill path, decode cap 64 steps
@@ -128,7 +130,7 @@ Start the OpenAI-compatible server:
   --disable-auth
 ```
 
-For long text, set `--max-decode-steps` high enough for the expected output length. Leaving it unset or using `0` keeps the conservative CUDA service defaults.
+For long text, set `--max-decode-steps` high enough for the expected output length. The HTTP server defaults to 1024 steps. Explicitly using `0` selects the conservative CUDA heuristic described above.
 
 Register a voice:
 
@@ -212,3 +214,9 @@ cmake --build build-cuda -j8
 3. Run `voxcpm_tts` with `--backend cuda`.
 4. Run `voxcpm-server` with `--backend cuda`.
 5. Test `mp3` and `opus` requests.
+
+Streaming uses inline CUDA AudioVAE decode. The asynchronous CPU chunk worker is
+restricted to Metal host-visible memory; enabling `VOXCPM_ASYNC_CHUNK_DECODE` cannot
+make a CPU worker borrow CUDA device buffers. Request completion releases compute
+arenas without unloading the shared model weights. Exhausting a decode budget
+without a stop token is reported as truncation, not a successful complete reply.

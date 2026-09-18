@@ -925,7 +925,7 @@ void VoxCPMServiceCore::load() {
     // loop. VOXCPM_ASYNC_CHUNK_DECODE=0 disables the worker.
     const char* async_chunk = std::getenv("VOXCPM_ASYNC_CHUNK_DECODE");
     const bool async_chunk_enabled = !(async_chunk && *async_chunk && std::strcmp(async_chunk, "0") == 0);
-    if (backend_->is_gpu() && !vae_backend_ && async_chunk_enabled) {
+    if (supports_async_cpu_chunks(backend_->type()) && !vae_backend_ && async_chunk_enabled) {
         // CPU, not a second GPU queue: on a single GPU another queue does not
         // reduce total GPU work, while the CPU sits idle during the decode
         // loop and chunk jobs arrive only every few steps. Unified memory
@@ -954,6 +954,33 @@ void VoxCPMServiceCore::load() {
     loaded_ = true;
 }
 
+namespace {
+
+// Declared inside the service lock, before request-local state. Cached graphs are
+// dropped before their arenas; synthesize_locked joins its worker before returning.
+class RequestArenaRelease {
+public:
+    RequestArenaRelease(VoxCPMRuntime& runtime, VoxCPMBackend* main,
+                        VoxCPMBackend* vae, VoxCPMBackend* stream)
+        : runtime_(runtime), backends_{main, vae, stream} {}
+    ~RequestArenaRelease() noexcept {
+        try { runtime_.reset_request_state(); }
+        catch (...) { std::cerr << "[runtime] failed to clear request graphs\n"; }
+        for (auto* backend : backends_) {
+            if (!backend) continue;
+            try { backend->reset_request_state(); }
+            catch (...) { std::cerr << "[runtime] failed to release request arena\n"; }
+        }
+    }
+    RequestArenaRelease(const RequestArenaRelease&) = delete;
+    RequestArenaRelease& operator=(const RequestArenaRelease&) = delete;
+private:
+    VoxCPMRuntime& runtime_;
+    VoxCPMBackend* backends_[3];
+};
+
+}  // namespace
+
 PromptFeatures VoxCPMServiceCore::encode_prompt_audio(const std::string& id,
                                                       const std::string& prompt_text,
                                                       const std::vector<float>& mono_audio,
@@ -962,6 +989,7 @@ PromptFeatures VoxCPMServiceCore::encode_prompt_audio(const std::string& id,
     if (!loaded_) {
         fail("Model core is not loaded");
     }
+    const RequestArenaRelease release_arena(runtime_, backend_.get(), vae_backend_.get(), stream_chunk_backend_.get());
     return encode_prompt_audio_locked(id, prompt_text, mono_audio, sample_rate);
 }
 
@@ -972,6 +1000,7 @@ PromptFeatures VoxCPMServiceCore::encode_reference_audio(const std::string& id,
     if (!loaded_) {
         fail("Model core is not loaded");
     }
+    const RequestArenaRelease release_arena(runtime_, backend_.get(), vae_backend_.get(), stream_chunk_backend_.get());
     if (!supports_reference_audio()) {
         fail("Reference audio requires GGUF voxcpm_architecture=voxcpm2");
     }
@@ -1050,59 +1079,12 @@ PromptFeatures VoxCPMServiceCore::encode_reference_audio_locked(const std::strin
     return features;
 }
 
-namespace {
-
-/**
- * Return the per-request compute arena when the work is finished, rather than leaving it
- * held until the next caller arrives.
- *
- * `reset_request_state` already runs at the start of every synthesis, so the arena is
- * rebuilt per request either way and releasing it here costs nothing in steady state.
- * What it changes is the idle footprint: without this, the arena reserved for the last
- * request stays resident indefinitely. Measured on one deployment, a 41-second utterance
- * left roughly 7 GiB of device memory held with the process idle, and it came back only
- * when some later request happened to reset it.
- *
- * That matters wherever this server shares a device. A co-tenant cannot use memory this
- * process is no longer using but has not given back, and the amount is set by the longest
- * utterance ever synthesized rather than by anything happening now.
- *
- * Runs on every exit, including the exceptional ones: a request that failed part-way has
- * reserved just as much as one that succeeded.
- */
-class RequestArenaRelease {
-public:
-    RequestArenaRelease(VoxCPMRuntime& runtime, VoxCPMBackend* backend)
-        : runtime_(runtime), backend_(backend) {}
-
-    ~RequestArenaRelease() {
-        // A destructor may not throw, and failing to return memory is not worth
-        // terminating a server that has otherwise produced a valid answer.
-        try {
-            runtime_.reset_request_state();
-            if (backend_ != nullptr) {
-                backend_->reset_request_state();
-            }
-        } catch (...) {
-        }
-    }
-
-    RequestArenaRelease(const RequestArenaRelease&) = delete;
-    RequestArenaRelease& operator=(const RequestArenaRelease&) = delete;
-
-private:
-    VoxCPMRuntime& runtime_;
-    VoxCPMBackend* backend_;
-};
-
-}  // namespace
-
 SynthesisResult VoxCPMServiceCore::synthesize(const SynthesisRequest& request) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!loaded_) {
         fail("Model core is not loaded");
     }
-    const RequestArenaRelease release_arena(runtime_, backend_.get());
+    const RequestArenaRelease release_arena(runtime_, backend_.get(), vae_backend_.get(), stream_chunk_backend_.get());
     return synthesize_locked(request);
 }
 
@@ -1373,6 +1355,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
             ++emitted_stream_chunks;
         };
 
+        bool stopped_by_model = false;
         for (int step = 0; step < max_len; ++step) {
             fill_noise(noise, patch_size_value, feat_dim_value, rng);
             VoxCPMDecodeOptions decode_options;
@@ -1433,6 +1416,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
             }
 
             if (step > kMinLen && result.output_2) {
+                stopped_by_model = true;
                 break;
             }
         }
@@ -1447,7 +1431,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                   << generated_frames
                   << " attempt=" << (attempt + 1)
                   << "\n";
-        if (generated_frames >= max_len && decode_step_budget < natural_max_len) {
+        if (!stopped_by_model) {
             std::cerr << "[tts] decode step budget reached before stop token; increase --max-decode-steps "
                          "if the output is truncated.\n";
         }
@@ -1480,6 +1464,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
             SynthesisResult result;
             result.sample_rate = audio_vae_.config().output_sample_rate();
             result.generated_frames = generated_frames;
+            result.truncated = !stopped_by_model;
             return result;
         }
         const bool use_stateful_final_audio_decode =
@@ -1562,10 +1547,20 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
             std::move(waveform),
             audio_vae_.config().output_sample_rate(),
             generated_frames,
+            !stopped_by_model,
         };
     }
 
     fail("Retry loop exhausted without producing an accepted sample");
+}
+
+size_t VoxCPMServiceCore::compute_buffer_size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t bytes = 0;
+    for (const auto* backend : {backend_.get(), vae_backend_.get(), stream_chunk_backend_.get()}) {
+        if (backend) bytes += backend->compute_buffer_size();
+    }
+    return bytes;
 }
 
 bool VoxCPMServiceCore::supports_reference_audio() const {

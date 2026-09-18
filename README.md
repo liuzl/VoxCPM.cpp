@@ -343,7 +343,7 @@ CUDA example:
   --disable-auth
 ```
 
-Use `--max-decode-steps` when serving long text. If omitted or set to `0`, the server keeps the conservative per-backend default decode budget.
+Use `--max-decode-steps` when serving long text. The server defaults to 1024 steps; explicitly setting `0` selects the conservative per-backend heuristic.
 
 CPU example:
 
@@ -642,3 +642,34 @@ I also plan to create a dedicated GGML inference repository for `https://hugging
 - Inference timesteps: 10
 - CFG value: 2.0
 - Benchmark source: `logs/benchmark_summary_cuda_20260318_092028.txt`
+
+### Request completion and compute lifetime
+
+The HTTP server defaults to `--max-decode-steps 1024`; `0` explicitly selects the
+older backend-dependent heuristic. A ceiling is not a promise of complete speech.
+The library reports `SynthesisResult.truncated` whenever generation ends without
+an accepted model stop token, including when the natural text budget is reached.
+Call `require_complete()` when partial audio is not acceptable. WAV/MP3 and SSE
+requests return HTTP 500 with `synthesis_truncated` rather than a successful partial
+answer. Raw PCM has already sent headers: it terminates without a successful final
+HTTP chunk, so clients must check transfer completion. Design profiles are not saved
+from truncated anchors.
+
+Every service request releases compute arenas after its local state and streaming
+worker have finished, including prompt/reference encoding and callback exceptions.
+This covers the main, separate AudioVAE and asynchronous chunk backends; shared
+weights are retained. `compute_buffer_size()` reports these arenas for diagnostics.
+The CPU chunk worker is restricted to Metal's host-visible buffers. CUDA and Vulkan
+use inline decode even when `VOXCPM_ASYNC_CHUNK_DECODE=1` is set.
+
+Bounded regression checks (model paths and outputs stay outside Git):
+
+```sh
+cmake --build build --target test_server_common voxcpm-server
+build/tests/test_server_common '~[integration]'
+VOXCPM_MODEL_PATH=/path/to/model.gguf VOXCPM_TEST_BACKEND=metal \
+  build/tests/test_server_common '[request-lifecycle]'
+# Repeat with VOXCPM_VAE_ON_CPU=1 for the separate AudioVAE backend.
+python3 tests/test_server_truncation.py --server build/examples/voxcpm-server \
+  --model /path/to/model.gguf --backend metal
+```
